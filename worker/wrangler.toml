@@ -1,0 +1,21 @@
+name = "screenshot-review-api"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+# The repo that stores screenshots and comments (can be the same repo as the site).
+GITHUB_OWNER = "eranthaWELIKALA"
+GITHUB_REPO = "review-desk-data"
+# Branch for review data. Keep it separate from the Pages branch so uploads
+# don't trigger a Pages rebuild. Create it once before first use (see README).
+GITHUB_BRANCH = "review-data"
+# Your GitHub Pages origin, e.g. "https://your-username.github.io". Comma-separate several.
+ALLOWED_ORIGINS = "https://eranthawelikala.github.io"
+# "true"  = images load straight from raw.githubusercontent.com (public repo only, faster)
+# "false" = images are served through this Worker (works with private repos)
+PUBLIC_IMAGES = "false"
+
+# Secrets — set with `npx wrangler secret put <NAME>`, never commit them:
+#   GITHUB_TOKEN  fine-grained token, this repo only, Contents: Read and write
+#   ADMIN_KEY     long random string; lets you create sections, upload, resolve, delete
+#   REVIEW_CODE   optional; if set, clients must enter it before viewing or commenting
