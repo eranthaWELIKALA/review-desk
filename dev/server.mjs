@@ -1,59 +1,46 @@
 // Local preview: serves the site and runs the real Worker against a fake GitHub
-// that stores everything in dev/.data/. No accounts or tokens needed.
+// (dev/fake-github.mjs) saved to dev/.data/github.json. No accounts or tokens needed.
 //
 //   node dev/server.mjs            → http://localhost:8787
-//   Admin key: dev-admin           (open http://localhost:8787/?admin)
-//   Set REVIEW_CODE=xyz to try the client code gate.
+//   Site admin key: dev-admin      (open http://localhost:8787/#/admin)
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import worker from '../worker/worker.js';
+import { createFakeGitHub, installFakeGitHub } from './fake-github.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const site = path.join(root, '..', 'docs');
-const dataDir = path.join(root, '.data');
+const dataFile = path.join(root, '.data', 'github.json');
 const PORT = Number(process.env.PORT || 8787);
 
 const env = {
   GITHUB_TOKEN: 'dev', GITHUB_OWNER: 'dev', GITHUB_REPO: 'dev', GITHUB_BRANCH: 'review-data',
   ADMIN_KEY: process.env.ADMIN_KEY || 'dev-admin',
-  REVIEW_CODE: process.env.REVIEW_CODE || '',
-  ALLOWED_ORIGINS: '*', PUBLIC_IMAGES: 'false',
+  SPACE_SECRET: 'dev-space-secret',
+  ALLOWED_ORIGINS: '*',
+  DEMO_PER_IP_PER_DAY: '50',
 };
 
-// ---- fake GitHub Contents API, backed by dev/.data ----
-const realFetch = globalThis.fetch;
-const sha = (buf) => crypto.createHash('sha1').update(buf).digest('hex');
-globalThis.fetch = async (url, init = {}) => {
-  const u = new URL(typeof url === 'string' ? url : url.url);
-  if (u.hostname !== 'api.github.com') return realFetch(url, init);
-  const rel = decodeURIComponent(u.pathname.replace(/^\/repos\/[^/]+\/[^/]+\/contents\//, ''));
-  const file = path.join(dataDir, rel);
-  if (!file.startsWith(dataDir)) return new Response('{}', { status: 400 });
-  const method = init.method || 'GET';
-  const existing = await fs.readFile(file).catch(() => null);
-  if (method === 'GET') {
-    if (!existing) return new Response('{}', { status: 404 });
-    if (String(init.headers?.Accept).includes('raw')) return new Response(existing);
-    return Response.json({ sha: sha(existing), encoding: 'base64', content: existing.toString('base64') });
-  }
-  const body = JSON.parse(init.body);
-  if (method === 'PUT') {
-    if (existing && body.sha !== sha(existing)) return new Response('{}', { status: 409 });
-    const buf = Buffer.from(body.content, 'base64');
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, buf);
-    return Response.json({ content: { sha: sha(buf) } });
-  }
-  if (method === 'DELETE') {
-    if (!existing) return new Response('{}', { status: 404 });
-    await fs.unlink(file);
-    return Response.json({});
-  }
-  return new Response('{}', { status: 405 });
-};
+let saved = null;
+try { saved = JSON.parse(readFileSync(dataFile, 'utf8')); } catch { /* first run */ }
+let timer;
+const fake = createFakeGitHub({
+  state: saved,
+  onChange: () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      mkdirSync(path.dirname(dataFile), { recursive: true });
+      writeFileSync(dataFile, JSON.stringify(fake.serialize()));
+    }, 300);
+  },
+});
+installFakeGitHub(fake);
+
+// Same schedule as production would be too slow to try out; run cleanup every minute.
+setInterval(() => worker.scheduled({}, env, { waitUntil: () => {} }), 60_000);
 
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
 
@@ -83,6 +70,6 @@ http.createServer(async (req, res) => {
     res.writeHead(404); res.end('Not found');
   }
 }).listen(PORT, () => {
-  console.log(`Screenshot Review running at http://localhost:${PORT}`);
-  console.log(`Admin: http://localhost:${PORT}/?admin   key: ${env.ADMIN_KEY}${env.REVIEW_CODE ? `   review code: ${env.REVIEW_CODE}` : ''}`);
+  console.log(`Review Desk running at http://localhost:${PORT}`);
+  console.log(`Site admin: http://localhost:${PORT}/#/admin   key: ${env.ADMIN_KEY}`);
 });

@@ -1,55 +1,97 @@
-/* Screenshot Review — static front end for GitHub Pages.
- * All reads/writes go through the Worker in config.js; nothing secret lives here. */
+/* Review Desk — static front end for GitHub Pages.
+ * All reads/writes go through the Worker in config.js; nothing secret lives here.
+ *
+ * Routes (hash):
+ *   #/                     home: try a demo, request a space, open one
+ *   #/admin                site admin console
+ *   #/r/<id>[/<token>]     status of a space request
+ *   #/<space>[/s/<sid>[/i/<iid>]]   a space, a section, a screenshot */
 (() => {
   'use strict';
 
   const API = String((window.REVIEW_CONFIG || {}).apiUrl || '').replace(/\/+$/, '');
   const MAX_UPLOAD = 15 * 1024 * 1024;
+  const SPACE_RE = /^[sd][a-z0-9]{10,30}$/;
+  const KEY_RE = /^sk-([sd][a-z0-9]{10,30})-[A-Za-z0-9_-]{22}$/;
+  const SITE = location.origin + location.pathname;
 
   /* ---------------------------------------------------------------- storage */
   const store = {
-    get(k) { try { return localStorage.getItem('sr:' + k); } catch { return null; } },
-    set(k, v) { try { v == null ? localStorage.removeItem('sr:' + k) : localStorage.setItem('sr:' + k, v); } catch { /* private mode */ } },
+    get(k) { try { return localStorage.getItem('rd:' + k); } catch { return null; } },
+    set(k, v) { try { v == null ? localStorage.removeItem('rd:' + k) : localStorage.setItem('rd:' + k, v); } catch { /* private mode */ } },
+    json(k) { try { return JSON.parse(this.get(k)) || null; } catch { return null; } },
+    setJson(k, v) { this.set(k, v == null ? null : JSON.stringify(v)); },
   };
+
+  // Keys and review codes per space, remembered on this device only.
+  const creds = {
+    all() { return store.json('spaces') || {}; },
+    get(id) { return (id && this.all()[id]) || {}; },
+    set(id, patch) {
+      const all = this.all();
+      all[id] = { ...all[id], ...patch, seen: Date.now() };
+      for (const k of Object.keys(all[id])) if (all[id][k] == null) delete all[id][k];
+      store.setJson('spaces', all);
+    },
+    forget(id) { const all = this.all(); delete all[id]; store.setJson('spaces', all); },
+  };
+  const myRequests = () => store.json('requests') || [];
+  const saveRequests = (list) => store.setJson('requests', list);
 
   /* ------------------------------------------------------------------ state */
   const state = {
+    route: { view: 'home' },
+    config: null,
     me: null,
     project: null,
-    code: store.get('code') || '',
-    adminKey: store.get('adminKey') || '',
+    siteKey: store.get('siteKey') || '',
+    overview: null,
+    usage: {},           // space id -> admin info (usage), loaded lazily
+    adminTab: 'requests',
+    request: null,       // status shown on #/r/<id>
     name: store.get('name') || '',
-    route: { sid: null, iid: null },
     drafts: {},          // composer text, keyed by draft id
     replyTo: null,       // comment id currently being replied to
     pinDraft: null,      // { x, y } on the open screenshot
     showResolved: {},    // target id -> bool
     highlight: null,     // comment id hovered
+    menuOpen: false,
+    welcome: null,       // demo id that was just created
     lastLoad: 0,
     busy: false,
   };
 
   /* ------------------------------------------------------------------- icons */
+  const svg = (d, w = 2) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
   const I = {
     logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round"><rect x="3" y="5" width="15" height="12"/><circle cx="18" cy="17" r="3.4" fill="currentColor" stroke="none"/></svg>',
-    upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>',
-    plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
-    edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
-    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
-    refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>',
-    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-    left: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
-    right: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
-    chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/></svg>',
-    pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.5-6-11a6 6 0 0 1 12 0c0 5.5-6 11-6 11z"/><circle cx="12" cy="10" r="2"/></svg>',
-    link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg>',
-    fit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+    upload: svg('<path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/>'),
+    plus: svg('<path d="M12 5v14M5 12h14"/>'),
+    edit: svg('<path d="M4 20h4L19 9l-4-4L4 16z"/>'),
+    trash: svg('<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>'),
+    refresh: svg('<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>'),
+    close: svg('<path d="M6 6l12 12M18 6L6 18"/>'),
+    left: svg('<path d="M15 6l-6 6 6 6"/>'),
+    right: svg('<path d="M9 6l6 6-6 6"/>'),
+    chat: svg('<path d="M4 5h16v11H9l-5 4z"/>', 2.2),
+    pin: svg('<path d="M12 21s-6-5.5-6-11a6 6 0 0 1 12 0c0 5.5-6 11-6 11z"/><circle cx="12" cy="10" r="2"/>'),
+    link: svg('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'),
+    fit: svg('<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>'),
+    share: svg('<path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7M16 6l-4-4-4 4M12 2v13"/>'),
+    dots: svg('<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>', 2.4),
+    spark: svg('<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>'),
+    box: svg('<path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7M12 11v10"/>'),
+    key: svg('<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M15 8l2 2"/>'),
+    clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
+    check: svg('<path d="M5 12l5 5L20 7"/>', 2.4),
+    x: svg('<path d="M6 6l12 12M18 6L6 18"/>', 2.4),
   };
 
   /* ---------------------------------------------------------------- helpers */
   const $ = (s, el = document) => el.querySelector(s);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const isAdmin = () => !!state.me?.admin;
+  const coarse = matchMedia('(pointer: coarse)').matches;
 
   const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
   function ago(iso) {
@@ -59,18 +101,32 @@
     for (const [lim, unit, div = 1] of steps) if (Math.abs(s) < lim) return rtf.format(Math.round(s / div), unit);
     return new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
   }
+  function timeLeft(iso) {
+    const m = Math.max(0, Math.round((Date.parse(iso) - Date.now()) / 60000));
+    return m >= 90 ? `${Math.round(m / 60)} h` : `${m} min`;
+  }
+  function fmtBytes(b) {
+    b = b || 0;
+    if (b < 1024 * 1024) return `${Math.max(b ? 1 : 0, Math.round(b / 1024))} KB`;
+    const mb = b / 1024 / 1024;
+    return `${mb < 10 ? mb.toFixed(1).replace(/\.0$/, '') : Math.round(mb)} MB`;
+  }
   function avatar(name) {
     let h = 0;
     for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
     const initials = name.trim().split(/\s+/).map((w) => [...w][0]).slice(0, 2).join('').toUpperCase();
     return `<div class="avatar" style="background:hsl(${h % 360} 45% 46%)" aria-hidden="true">${esc(initials)}</div>`;
   }
+  const spaceId = () => state.route.space;
+  const spaceCode = () => state.me?.reviewCode || creds.get(spaceId()).code || '';
   function imageUrl(img) {
-    if (state.me?.imageBase) return state.me.imageBase + img.path.split('/').map(encodeURIComponent).join('/');
-    const q = state.code ? `?code=${encodeURIComponent(state.code)}` : '';
-    return `${API}/img/${img.path.split('/').map(encodeURIComponent).join('/')}${q}`;
+    const code = spaceCode();
+    return `${API}/img/${spaceId()}/${img.path.split('/').map(encodeURIComponent).join('/')}${code ? `?code=${encodeURIComponent(code)}` : ''}`;
   }
+  const reviewLink = (id, code, rest = '') => `${SITE}${code ? `?code=${encodeURIComponent(code)}` : ''}#/${id}${rest}`;
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const usedBytes = () => (state.project?.sections || []).reduce((n, s) => n + s.images.reduce((m, i) => m + (i.bytes || 0), 0), 0);
+  const meter = (used, quota) => `<span class="meter" role="img" aria-label="${fmtBytes(used)} of ${fmtBytes(quota)} used"><span style="width:${Math.min(100, quota ? (used / quota) * 100 : 0).toFixed(1)}%" class="${used / quota > 0.9 ? 'full' : ''}"></span></span>`;
 
   function toast(msg, type = '') {
     const el = document.createElement('div');
@@ -81,17 +137,25 @@
     return el;
   }
 
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { prompt('Copy this:', text); }
+  }
+
   /* -------------------------------------------------------------------- api */
-  async function api(method, path, body) {
+  async function api(method, path, body, { space = spaceId() } = {}) {
     const headers = {};
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    if (state.code) headers['X-Review-Code'] = state.code;
-    if (state.adminKey) headers['X-Admin-Key'] = state.adminKey;
+    if (state.siteKey) headers['X-Admin-Key'] = state.siteKey;
+    if (space) {
+      const c = creds.get(space);
+      if (c.key) headers['X-Space-Key'] = c.key;
+      if (c.code) headers['X-Review-Code'] = c.code;
+    }
     let res;
     try {
       res = await fetch(API + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     } catch {
-      throw new Error('Could not reach the review server. Check your connection and the apiUrl in config.js.');
+      throw new Error('Could not reach the review server. Check your connection and try again.');
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -107,18 +171,6 @@
     const list = state.project.sections;
     const i = list.findIndex((s) => s.id === section.id);
     if (i === -1) list.push(section); else list[i] = section;
-  }
-
-  async function load({ quiet = false } = {}) {
-    try {
-      state.project = await api('GET', '/api/project');
-      state.lastLoad = Date.now();
-      document.title = state.project.title;
-      render();
-    } catch (e) {
-      if (e.status === 401) { state.code = ''; store.set('code', null); return boot(); }
-      if (!quiet) toast(e.message, 'error');
-    }
   }
 
   async function run(fn, okMsg) {
@@ -139,25 +191,332 @@
 
   /* ----------------------------------------------------------------- router */
   function parseRoute() {
-    const m = location.hash.match(/^#\/s\/([a-z0-9]+)(?:\/i\/([a-z0-9]+))?/);
-    state.route = { sid: m?.[1] || null, iid: m?.[2] || null };
+    const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
+    if (parts[0] === 'admin') return { view: 'admin' };
+    if (parts[0] === 'r' && parts[1]) return { view: 'request', rid: parts[1], token: parts[2] || null };
+    if (SPACE_RE.test(parts[0] || '')) {
+      return { view: 'space', space: parts[0], sid: parts[1] === 's' ? parts[2] || null : null, iid: parts[3] === 'i' ? parts[4] || null : null };
+    }
+    return { view: 'home' };
   }
-  function go(sid, iid) {
-    const hash = sid ? `#/s/${sid}${iid ? `/i/${iid}` : ''}` : '';
-    if (location.hash !== hash) location.hash = hash; else render();
+  const spaceHash = (id, sid, iid) => `#/${id}${sid ? `/s/${sid}${iid ? `/i/${iid}` : ''}` : ''}`;
+  function nav(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
+  const go = (sid, iid) => nav(spaceHash(spaceId(), sid, iid));
+  window.addEventListener('hashchange', () => route());
+
+  async function route() {
+    const prev = state.route;
+    const r = parseRoute();
+    state.route = r;
+    state.menuOpen = false;
+    $('#modal-root').innerHTML = '';
+    if (r.view === 'space') {
+      if (prev.view !== 'space' || prev.space !== r.space || !state.project) return openSpace(r.space);
+      if (r.iid !== prev.iid) { state.pinDraft = null; state.replyTo = null; }
+      return render();
+    }
+    state.project = null;
+    state.me = null;
+    document.body.style.overflow = '';
+    if (r.view === 'admin') return openAdmin();
+    if (r.view === 'request') return openRequest(r.rid, r.token);
+    document.title = 'Review Desk';
+    return render();
   }
-  window.addEventListener('hashchange', () => {
-    const prevImg = state.route.iid;
-    parseRoute();
-    if (state.route.iid !== prevImg) { state.pinDraft = null; state.replyTo = null; }
+
+  function render() {
+    const v = state.route.view;
+    if (v === 'space') return renderSpace();
+    if (v === 'admin') return renderAdmin();
+    if (v === 'request') return renderRequest();
+    return renderHome();
+  }
+
+  /* ------------------------------------------------------------- page bits */
+  const brand = (label = 'Review Desk') => `<a class="brand" href="#/" title="Review Desk home"><div class="brand-mark">${I.logo}</div><span>${esc(label)}</span></a>`;
+
+  function page(inner) {
+    $('#app').innerHTML = `<header class="topbar">${brand()}<div class="spacer"></div></header><main class="page">${inner}</main>`;
+  }
+  function loading() { $('#app').innerHTML = '<div class="boot">Loading…</div>'; }
+
+  function notice({ icon = '', tone = '', title, text = '', actions = '' }) {
+    page(`<div class="notice ${tone}">${icon ? `<div class="notice-icon">${icon}</div>` : ''}<h1>${esc(title)}</h1>${text ? `<p>${text}</p>` : ''}${actions ? `<div class="notice-actions">${actions}</div>` : ''}</div>`);
+  }
+  const homeBtn = '<a class="btn" href="#/">Go to home page</a>';
+
+  function copyField(label, value, { secret = false } = {}) {
+    return `<div class="copy-field">
+      <label>${esc(label)}</label>
+      <div class="cf-row">
+        <input class="input mono" readonly value="${esc(value)}" ${secret ? 'data-secret' : ''} aria-label="${esc(label)}">
+        <button type="button" class="btn sm" data-action="copy" data-text="${esc(value)}">Copy</button>
+      </div>
+    </div>`;
+  }
+
+  /* ------------------------------------------------------------------- home */
+  function renderHome() {
+    const cfg = state.config;
+    const demoId = store.get('demo');
+    const demo = demoId ? creds.get(demoId) : null;
+    const demoActive = demo?.key && Date.parse(demo.expiresAt) > Date.now();
+    const quota = cfg ? fmtBytes(cfg.demo.quotaBytes) : '5 MB';
+    const hours = cfg ? cfg.demo.hours : 24;
+
+    const spaces = Object.entries(creds.all())
+      .filter(([id, c]) => (c.key || c.code) && !(c.kind === 'demo' && c.expiresAt && Date.parse(c.expiresAt) < Date.now()) && SPACE_RE.test(id))
+      .sort((a, b) => (b[1].seen || 0) - (a[1].seen || 0));
+    const reqs = myRequests();
+
+    $('#app').innerHTML = `
+      <header class="topbar">${brand()}<div class="spacer"></div>
+        <button class="btn ghost sm" data-action="request-space">Request a space</button>
+      </header>
+      <main class="page home">
+        <section class="hero">
+          <h1>Feedback pinned to the exact spot.</h1>
+          <p>Upload screenshots, share one link, and let clients comment right on the design. Reviewers don’t need an account.</p>
+        </section>
+        <div class="options">
+          <article class="option accent">
+            <div class="option-icon">${I.spark}</div>
+            <h2>Try it now</h2>
+            <p>A private demo space with ${quota} of storage. No sign-up. Everything is deleted after ${hours} hours.</p>
+            <div class="option-foot">
+              ${demoActive
+                ? `<a class="btn primary" href="#/${demoId}">Continue your demo</a><span class="muted">${timeLeft(demo.expiresAt)} left</span>`
+                : `<button class="btn primary" data-action="start-demo" ${cfg && !cfg.demo.enabled ? 'disabled title="Demos are turned off"' : ''}>Start a demo</button>`}
+            </div>
+          </article>
+          <article class="option">
+            <div class="option-icon">${I.box}</div>
+            <h2>Get your own space</h2>
+            <p>For real projects: ${cfg ? fmtBytes(cfg.spaceQuotaBytes) : 'more'} of storage and nothing expires. Tell us what it’s for and an admin will set it up.</p>
+            <div class="option-foot"><button class="btn" data-action="request-space">Request a space</button></div>
+          </article>
+          <article class="option">
+            <div class="option-icon">${I.key}</div>
+            <h2>Have a key or link?</h2>
+            <p>Paste your space key, or a review link someone sent you.</p>
+            <form class="option-foot open-form" data-form="open">
+              <label class="sr-only" for="open-value">Space key or review link</label>
+              <input class="input" id="open-value" name="value" placeholder="sk-… or https://…" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+              <button class="btn" type="submit">Open</button>
+            </form>
+          </article>
+        </div>
+
+        ${spaces.length ? `<section class="list-block">
+          <h3>On this device</h3>
+          <div class="rows">${spaces.map(([id, c]) => `
+            <div class="row-item">
+              <a class="ri-main" href="#/${id}">
+                <span class="ri-title">${esc(c.title || 'Untitled space')}</span>
+                <span class="ri-sub">${c.kind === 'demo' ? `<span class="pill demo">Demo</span> ends in ${timeLeft(c.expiresAt)}` : '<span class="pill">Space</span>'} · ${c.key ? 'Owner' : 'Reviewer'}</span>
+              </a>
+              <button class="btn ghost icon sm" data-action="forget-space" data-id="${id}" title="Forget on this device" aria-label="Forget ${esc(c.title || 'space')} on this device">${I.close}</button>
+            </div>`).join('')}
+          </div>
+        </section>` : ''}
+
+        ${reqs.length ? `<section class="list-block">
+          <h3>Your space requests</h3>
+          <div class="rows">${reqs.map((r) => `
+            <div class="row-item">
+              <a class="ri-main" href="#/r/${esc(r.id)}">
+                <span class="ri-title">Request from ${esc(ago(r.createdAt))}</span>
+                <span class="ri-sub">${esc(r.lastStatus ? statusLabel(r.lastStatus) : 'Check status')}</span>
+              </a>
+            </div>`).join('')}
+          </div>
+        </section>` : ''}
+
+        <footer class="home-foot"><a href="#/admin">Site admin</a></footer>
+      </main>`;
+  }
+
+  function openFromInput(value) {
+    const v = value.trim();
+    const k = v.match(KEY_RE);
+    if (k) { creds.set(k[1], { key: v }); return nav(spaceHash(k[1])); }
+    try {
+      const u = new URL(v);
+      const rest = u.hash.replace(/^#\/?/, '');
+      const id = rest.split('/')[0];
+      if (SPACE_RE.test(id)) {
+        const code = u.searchParams.get('code');
+        if (code) creds.set(id, { code });
+        return nav(`#/${rest}`);
+      }
+    } catch { /* not a URL */ }
+    if (SPACE_RE.test(v)) return nav(spaceHash(v));
+    toast('Paste a space key (starts with sk-) or the full review link', 'error');
+  }
+
+  /* --------------------------------------------------------------- requests */
+  const statusLabel = (s) => ({ pending: 'Waiting for approval', approved: 'Approved', rejected: 'Not approved' }[s] || s);
+
+  async function openRequest(id, tokenFromUrl) {
+    let list = myRequests();
+    let entry = list.find((r) => r.id === id);
+    if (tokenFromUrl) {
+      if (!entry) { entry = { id, token: tokenFromUrl, createdAt: new Date().toISOString() }; list.push(entry); saveRequests(list); }
+      history.replaceState(null, '', `${location.pathname}#/r/${id}`); // keep the token out of the address bar
+    }
+    if (!entry) {
+      return notice({ title: 'Request not found on this device', text: 'Open the status link you saved when you sent the request.', actions: homeBtn });
+    }
+    loading();
+    try {
+      state.request = await api('POST', `/api/requests/${id}/status`, { token: entry.token }, { space: null });
+    } catch (e) {
+      return notice({ title: 'Couldn’t load this request', text: esc(e.message), actions: homeBtn });
+    }
+    const st = state.request;
+    if (st.adminKey) creds.set(st.spaceId, { key: st.adminKey, code: st.reviewCode, title: st.title, kind: 'space' });
+    list = myRequests();
+    const i = list.findIndex((r) => r.id === id);
+    if (i !== -1) { list[i].lastStatus = st.status; saveRequests(list); }
+    document.title = 'Space request · Review Desk';
     render();
-  });
+  }
+
+  function renderRequest() {
+    const st = state.request;
+    if (!st) return loading();
+    const entry = myRequests().find((r) => r.id === st.id);
+    const statusLink = entry ? `${SITE}#/r/${st.id}/${entry.token}` : '';
+    const local = st.spaceId ? creds.get(st.spaceId) : {};
+
+    if (st.status === 'pending') {
+      return notice({
+        icon: I.clock, title: 'Request received',
+        text: `An admin will review it soon. This page shows the result when you come back.</p>
+          <div class="notice-box">${copyField('Status link (keep it private; it collects your space key once approved)', statusLink, { secret: true })}</div><p class="muted">Sent ${esc(ago(st.createdAt))}.`,
+        actions: `<button class="btn primary" data-action="check-request">${I.refresh}Check again</button>${homeBtn}`,
+      });
+    }
+    if (st.status === 'rejected') {
+      return notice({
+        icon: I.x, tone: 'danger', title: 'Request not approved',
+        text: st.reason ? `Reason: ${esc(st.reason)}` : 'The admin didn’t approve this request.',
+        actions: `<button class="btn" data-action="drop-request" data-id="${esc(st.id)}">Remove from this list</button>${homeBtn}`,
+      });
+    }
+    // approved
+    if (local.key) {
+      return notice({
+        icon: I.check, tone: 'ok', title: 'Your space is ready',
+        text: `Your space key is saved in this browser. Copy it somewhere safe, like a password manager. <b>It can’t be retrieved again</b>, and you need it to manage the space from another device.</p>
+          <div class="notice-box">
+            ${copyField('Space key (owner access; keep it private)', local.key, { secret: true })}
+            ${local.code ? copyField('Reviewer link (share this with your reviewers)', reviewLink(st.spaceId, local.code)) : ''}
+          </div><p>`,
+        actions: `<a class="btn primary" href="#/${st.spaceId}">Open your space</a>`,
+      });
+    }
+    return notice({
+      icon: I.check, tone: 'ok', title: 'Your space was approved',
+      text: 'The space key was already collected, probably on another device or browser. If you’ve lost it, contact the admin who approved your request.',
+      actions: homeBtn,
+    });
+  }
+
+  /* ---------------------------------------------------------------- spaces */
+  async function openSpace(id) {
+    state.project = null;
+    state.me = null;
+    loading();
+    let me;
+    try {
+      me = await api('GET', `/api/s/${id}/me`, undefined, { space: id });
+    } catch (e) {
+      if (e.status === 410) {
+        creds.forget(id);
+        if (store.get('demo') === id) store.set('demo', null);
+        return notice({
+          icon: I.clock, title: 'This demo has ended',
+          text: 'Demo spaces and their screenshots are deleted automatically when they expire.',
+          actions: '<button class="btn primary" data-action="start-demo">Start a new demo</button><button class="btn" data-action="request-space">Request a space</button>',
+        });
+      }
+      if (e.status === 404) return notice({ title: 'Space not found', text: 'It may have been deleted, or the link is incomplete.', actions: homeBtn });
+      return notice({ title: 'Can’t reach the review server', text: esc(e.message), actions: '<button class="btn" data-action="reload">Try again</button>' });
+    }
+    const c = creds.get(id);
+    if (c.key && !me.admin) creds.set(id, { key: null }); // the key was rotated
+    if (!me.authorized) {
+      if (c.code) creds.set(id, { code: null });
+      return spaceGate(id, c.code ? 'That review code no longer works. Ask for a new link.' : '', me.space);
+    }
+    state.me = me;
+    if (c.key || c.code) creds.set(id, { title: me.space.title, kind: me.space.kind, expiresAt: me.space.expiresAt, ...(c.key ? { code: me.reviewCode } : {}) });
+    await load();
+    if (state.welcome === id) { state.welcome = null; welcomeDemo(); }
+  }
+
+  async function load({ quiet = false } = {}) {
+    const id = spaceId();
+    try {
+      state.project = await api('GET', `/api/s/${id}/project`);
+      state.lastLoad = Date.now();
+      document.title = `${state.project.title} · Review Desk`;
+      render();
+    } catch (e) {
+      if ([401, 404, 410].includes(e.status)) return openSpace(id);
+      if (!quiet) toast(e.message, 'error');
+    }
+  }
+
+  function spaceGate(id, message, info, asOwner = false) {
+    const demo = info?.kind === 'demo';
+    page(`
+      <form class="card-form" id="gate-form" novalidate>
+        <h1>${asOwner ? 'Owner sign-in' : 'Enter the review code'}</h1>
+        <p>${asOwner ? 'Paste the space key you received when the space was created.' : 'You should have received it with the link to this page.'}${demo && info.expiresAt ? ` This demo space ends in ${timeLeft(info.expiresAt)}.` : ''}</p>
+        <div class="field">
+          <label for="gate-value">${asOwner ? 'Space key' : 'Review code'}</label>
+          <input class="input ${asOwner ? 'mono' : 'code-input'}" id="gate-value" ${asOwner ? 'type="password" placeholder="sk-…"' : 'placeholder="ABCD-EFGH" autocapitalize="characters"'} autocomplete="off" spellcheck="false" required>
+        </div>
+        ${message ? `<div class="err">${esc(message)}</div>` : ''}
+        <div class="row">
+          <button type="button" class="link-btn" id="gate-switch">${asOwner ? 'I have a review code' : 'I own this space'}</button>
+          <button class="btn primary" type="submit">Continue</button>
+        </div>
+      </form>`);
+    $('#gate-value').focus();
+    $('#gate-switch').onclick = () => spaceGate(id, '', info, !asOwner);
+    $('#gate-form').onsubmit = (e) => {
+      e.preventDefault();
+      const v = $('#gate-value').value.trim();
+      if (!v) return;
+      if (asOwner) {
+        const m = v.match(KEY_RE);
+        if (!m) return spaceGate(id, 'That doesn’t look like a space key. It starts with “sk-”.', info, true);
+        if (m[1] !== id) return spaceGate(id, 'That key belongs to a different space.', info, true);
+        creds.set(id, { key: v });
+      } else {
+        creds.set(id, { code: v });
+      }
+      openSpace(id);
+    };
+  }
+
+  function welcomeDemo() {
+    const p = state.project.space;
+    modal({
+      title: 'Your demo space is ready',
+      text: `You own this space. Create a section, upload screenshots (up to ${fmtBytes(p.quotaBytes)} in total), then use <b>Share</b> to invite reviewers. Everything is deleted automatically in ${timeLeft(p.expiresAt)}.`,
+      confirm: 'Get started', cancel: false,
+      onSubmit: () => {},
+    });
+  }
 
   const currentSection = () => state.project?.sections.find((s) => s.id === state.route.sid) || state.project?.sections[0] || null;
   const openCount = (comments, target) => comments.filter((c) => !c.parentId && !c.resolved && (target === undefined || c.target === target)).length;
 
-  /* ----------------------------------------------------------------- render */
-  function render() {
+  function renderSpace() {
     const app = $('#app');
     if (!state.project) return;
 
@@ -171,7 +530,8 @@
     if (section && state.route.sid !== section.id && !state.route.iid) state.route.sid = section.id;
 
     app.innerHTML = `
-      ${topbar()}
+      ${spaceTopbar()}
+      ${spaceStrip()}
       <div class="shell">
         ${sidebar(section)}
         <main class="main">${section ? sectionView(section) : emptyProject()}</main>
@@ -186,17 +546,55 @@
     }
   }
 
-  function topbar() {
+  function spaceTopbar() {
     const admin = isAdmin();
+    const p = state.project;
     return `
       <header class="topbar">
-        <div class="brand"><div class="brand-mark">${I.logo}</div><span>${esc(state.project.title)}</span></div>
-        ${admin ? `<button class="btn ghost sm icon" data-action="rename-project" title="Rename project">${I.edit}</button>` : ''}
+        <a class="brand" href="#/" title="Review Desk home"><div class="brand-mark">${I.logo}</div></a>
+        <div class="tb-title">
+          <span class="t">${esc(p.title)}</span>
+          ${admin ? `<button class="btn ghost sm icon" data-action="rename-project" title="Rename space" aria-label="Rename space">${I.edit}</button>` : ''}
+        </div>
         <div class="spacer"></div>
-        <button class="btn ghost sm" data-action="refresh" title="Load latest comments">${I.refresh}<span class="hide-sm">Refresh</span></button>
-        ${state.name ? `<button class="chip" data-action="change-name" title="Change your name" style="border:0;cursor:pointer">${esc(state.name)}</button>` : ''}
-        ${admin ? `<span class="chip admin">Admin</span><button class="btn ghost sm" data-action="admin-out">Sign out</button>` : ''}
+        <button class="btn ghost sm" data-action="refresh" title="Load latest comments" aria-label="Refresh">${I.refresh}<span class="hide-sm">Refresh</span></button>
+        ${admin ? `<button class="btn primary sm" data-action="share" title="Invite reviewers">${I.share}<span class="hide-xs">Share</span></button>` : ''}
+        <div class="menu-wrap">
+          <button class="btn ghost sm icon" data-action="menu" aria-haspopup="menu" aria-expanded="${state.menuOpen}" title="More" aria-label="More options">${I.dots}</button>
+          ${state.menuOpen ? spaceMenu() : ''}
+        </div>
       </header>`;
+  }
+
+  function spaceMenu() {
+    const admin = isAdmin();
+    const c = creds.get(spaceId());
+    const demo = state.project.space.kind === 'demo';
+    const role = state.me.siteAdmin && !c.key ? 'Site admin' : admin ? 'Owner' : 'Reviewer';
+    return `<div class="menu" role="menu">
+      <div class="menu-head">${esc(role)}${state.name ? ` · ${esc(state.name)}` : ''}</div>
+      <button role="menuitem" data-action="change-name">${state.name ? 'Change your name' : 'Set your name'}</button>
+      ${admin ? '<button role="menuitem" data-action="rotate-code">New review code…</button>' : ''}
+      ${!admin ? '<button role="menuitem" data-action="owner-in">Owner sign-in…</button>' : ''}
+      ${admin && c.key ? '<button role="menuitem" data-action="owner-out">Sign out as owner</button>' : ''}
+      <button role="menuitem" data-action="forget-space" data-id="${spaceId()}">Forget on this device</button>
+      ${demo && admin ? '<button role="menuitem" class="danger" data-action="delete-demo">Delete this demo now…</button>' : ''}
+      <a role="menuitem" href="#/">All spaces</a>
+    </div>`;
+  }
+
+  function spaceStrip() {
+    const s = state.project.space;
+    const used = usedBytes();
+    if (s.kind === 'demo') {
+      return `<div class="strip demo">
+        <span>${I.clock}<b>Demo</b> · deleted in ${timeLeft(s.expiresAt)}</span>
+        ${isAdmin() ? `<span class="strip-usage">${meter(used, s.quotaBytes)}${fmtBytes(used)} of ${fmtBytes(s.quotaBytes)}</span>` : ''}
+        <button class="link-btn" data-action="request-space">Get a permanent space</button>
+      </div>`;
+    }
+    if (!isAdmin()) return '';
+    return `<div class="strip"><span class="strip-usage">Storage ${meter(used, s.quotaBytes)}${fmtBytes(used)} of ${fmtBytes(s.quotaBytes)}</span></div>`;
   }
 
   function sidebar(current) {
@@ -212,14 +610,13 @@
         <h2>Sections</h2>
         ${items}
         ${isAdmin() ? `<button class="btn sm add" data-action="new-section">${I.plus}New section</button>` : ''}
-        ${!isAdmin() ? `<button class="footer-link" data-action="admin-in">Team sign-in</button>` : ''}
       </nav>`;
   }
 
   function emptyProject() {
     return isAdmin()
       ? `<div class="empty"><h3>No sections yet</h3><p>Create a section (e.g. “Onboarding”, “Checkout”) and upload screenshots into it.</p><button class="btn primary" data-action="new-section">${I.plus}Create first section</button></div>`
-      : `<div class="empty"><h3>Nothing to review yet</h3><p>Screenshots will appear here once the team uploads them.</p></div>`;
+      : '<div class="empty"><h3>Nothing to review yet</h3><p>Screenshots will appear here once the team uploads them.</p></div>';
   }
 
   function sectionView(s) {
@@ -249,7 +646,7 @@
             <button class="btn sm primary" data-action="pick-files">${I.upload}Upload</button>` : ''}
         </div>
       </div>
-      ${admin ? `<div class="dropzone" id="dropzone">${I.upload}<span>Drop screenshots here<span class="long">, or paste one with Ctrl/⌘ + V</span></span></div>
+      ${admin ? `<div class="dropzone" id="dropzone">${I.upload}<span>${coarse ? 'Tap Upload to add screenshots' : 'Drop screenshots here<span class="long">, or paste one with Ctrl/⌘ + V</span>'}</span></div>
         <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>` : ''}
       ${s.images.length ? `<div class="grid">${cards}</div>` : `<div class="empty"><h3>No screenshots in this section</h3><p>${admin ? 'Upload some to start collecting feedback.' : 'Check back soon.'}</p></div>`}
       <section class="feedback">
@@ -276,7 +673,7 @@
     }).join('');
 
     return `<div class="threads">
-      ${html || (hidden ? '' : `<div class="no-comments">No comments yet${target === 'section' ? '' : ' — click the screenshot to pin one'}.</div>`)}
+      ${html || (hidden ? '' : `<div class="no-comments">No comments yet${target === 'section' ? '' : ` — ${coarse ? 'tap' : 'click'} the screenshot to pin one`}.</div>`)}
       ${hidden || showRes && all.some((c) => c.resolved) ? `<button class="link-btn resolved-toggle" data-action="toggle-resolved" data-target="${target}">${showRes ? 'Hide resolved' : `Show ${plural(hidden, 'resolved comment')}`}</button>` : ''}
     </div>`;
   }
@@ -306,7 +703,7 @@
   function composer(s, target, parentId = null) {
     const key = `${s.id}:${target}:${parentId || ''}`;
     const isImage = target !== 'section' && !parentId;
-    const placeholder = parentId ? 'Write a reply…' : isImage ? (state.pinDraft ? 'What about this spot?' : 'Comment on this screenshot, or click it to pin a spot…') : 'Share feedback on this section…';
+    const placeholder = parentId ? 'Write a reply…' : isImage ? (state.pinDraft ? 'What about this spot?' : `Comment on this screenshot, or ${coarse ? 'tap' : 'click'} it to pin a spot…`) : 'Share feedback on this section…';
     return `<form class="composer" data-action="post" data-target="${target}" data-parent="${parentId || ''}" data-key="${key}">
       ${isImage && state.pinDraft ? `<div class="pin-draft">${I.pin.replace('<svg', '<svg width="13" height="13"')}Pinned to a spot<button type="button" data-action="clear-pin" aria-label="Remove pin">×</button></div>` : ''}
       <label class="sr-only" for="ta-${esc(key)}">${placeholder}</label>
@@ -314,7 +711,7 @@
       <div class="row">
         ${state.name
           ? `<span class="as">Commenting as <b>${esc(state.name)}</b></span>`
-          : `<input class="input name-input" name="author" placeholder="Your name" maxlength="60" required autocomplete="name"><span class="as"></span>`}
+          : '<input class="input name-input" name="author" placeholder="Your name" maxlength="60" required autocomplete="name"><span class="as"></span>'}
         ${parentId ? '<button type="button" class="btn ghost sm" data-action="cancel-reply">Cancel</button>' : ''}
         <button class="btn primary sm" type="submit">${parentId ? 'Reply' : 'Post'}</button>
       </div>
@@ -344,15 +741,16 @@
     return `
       <div class="viewer" role="dialog" aria-modal="true" aria-label="${esc(img.caption || img.name)}">
         <div class="viewer-bar">
-          <button class="btn ghost icon" data-action="close-viewer" title="Close (Esc)">${I.close}</button>
-          <div class="title"><b>${esc(img.caption || img.name)}</b><small>${esc(s.title)}</small></div>
-          <span class="pos">${idx + 1} / ${s.images.length}</span>
-          <button class="btn ghost icon" data-action="toggle-fit" title="${fit ? 'Actual size' : 'Fit to screen'}">${I.fit}</button>
-          <button class="btn ghost icon" data-action="copy-link" data-sid="${s.id}" data-iid="${img.id}" title="Copy link to this screenshot">${I.link}</button>
-          <button class="btn ghost icon" data-action="nav-image" data-dir="-1" title="Previous (←)" ${idx === 0 ? 'disabled' : ''}>${I.left}</button>
-          <button class="btn ghost icon" data-action="nav-image" data-dir="1" title="Next (→)" ${idx === s.images.length - 1 ? 'disabled' : ''}>${I.right}</button>
-          ${isAdmin() ? `<button class="btn ghost icon" data-action="edit-caption" title="Edit caption">${I.edit}</button>
-            <button class="btn ghost icon danger" data-action="delete-image" title="Delete screenshot">${I.trash}</button>` : ''}
+          <button class="btn ghost icon" data-action="close-viewer" title="Close (Esc)" aria-label="Close">${I.close}</button>
+          <div class="title"><b>${esc(img.caption || img.name)}</b><small>${esc(s.title)} · ${idx + 1} / ${s.images.length}</small></div>
+          <div class="vtools">
+            <button class="btn ghost icon hide-sm" data-action="toggle-fit" title="${fit ? 'Actual size' : 'Fit to screen'}" aria-label="${fit ? 'Actual size' : 'Fit to screen'}">${I.fit}</button>
+            <button class="btn ghost icon hide-sm" data-action="copy-link" data-sid="${s.id}" data-iid="${img.id}" title="Copy link to this screenshot" aria-label="Copy link">${I.link}</button>
+            ${isAdmin() ? `<button class="btn ghost icon" data-action="edit-caption" title="Edit caption" aria-label="Edit caption">${I.edit}</button>
+              <button class="btn ghost icon danger" data-action="delete-image" title="Delete screenshot" aria-label="Delete screenshot">${I.trash}</button>` : ''}
+            <button class="btn ghost icon" data-action="nav-image" data-dir="-1" title="Previous (←)" aria-label="Previous" ${idx === 0 ? 'disabled' : ''}>${I.left}</button>
+            <button class="btn ghost icon" data-action="nav-image" data-dir="1" title="Next (→)" aria-label="Next" ${idx === s.images.length - 1 ? 'disabled' : ''}>${I.right}</button>
+          </div>
         </div>
         <div class="viewer-body" data-keep-scroll="body">
           <div class="stage ${fit ? 'fit' : ''}" data-keep-scroll="stage">
@@ -364,7 +762,7 @@
           <aside class="panel">
             <div class="panel-scroll" data-keep-scroll="panel">
               <p class="caption">Comments</p>
-              <div class="hint">${I.pin}<span>Click anywhere on the screenshot to pin a comment to that exact spot.</span></div>
+              <div class="hint">${I.pin}<span>${coarse ? 'Tap' : 'Click'} anywhere on the screenshot to pin a comment to that exact spot.</span></div>
               ${threads(s, img.id)}
             </div>
             <div class="panel-foot">${state.replyTo && s.comments.some((c) => c.id === state.replyTo && c.target === img.id) ? '' : composer(s, img.id)}</div>
@@ -373,30 +771,194 @@
       </div>`;
   }
 
+  /* ------------------------------------------------------------- site admin */
+  async function openAdmin() {
+    document.title = 'Site admin · Review Desk';
+    if (!state.siteKey) return adminGate();
+    loading();
+    try {
+      state.overview = await api('GET', '/api/admin/overview', undefined, { space: null });
+    } catch (e) {
+      if (e.status === 403) { state.siteKey = ''; store.set('siteKey', null); return adminGate('That key is not correct.'); }
+      return notice({ title: 'Can’t load the admin console', text: esc(e.message), actions: '<button class="btn" data-action="reload">Try again</button>' });
+    }
+    state.usage = {};
+    render();
+    loadUsage();
+  }
+
+  function adminGate(message = '') {
+    page(`
+      <form class="card-form" id="admin-form" novalidate>
+        <h1>Site admin</h1>
+        <p>Approve space requests and manage every space. Enter the <code>ADMIN_KEY</code> set on the Worker.</p>
+        <div class="field"><label for="admin-key">Admin key</label><input class="input mono" id="admin-key" type="password" autocomplete="current-password" required></div>
+        ${message ? `<div class="err">${esc(message)}</div>` : ''}
+        <div class="row"><a class="btn ghost" href="#/">Cancel</a><button class="btn primary" type="submit">Sign in</button></div>
+      </form>`);
+    $('#admin-key').focus();
+    $('#admin-form').onsubmit = (e) => {
+      e.preventDefault();
+      const key = $('#admin-key').value.trim();
+      if (!key) return;
+      state.siteKey = key;
+      store.set('siteKey', key);
+      openAdmin();
+    };
+  }
+
+  // Usage needs one read per space, so it loads per space after the list renders.
+  function loadUsage() {
+    const ids = [...state.overview.spaces.map((s) => s.id), ...state.overview.demos.map((d) => d.id)];
+    let pending = 0;
+    const flush = () => { if (state.route.view === 'admin') render(); };
+    for (const id of ids) {
+      pending++;
+      api('GET', `/api/admin/spaces/${id}`, undefined, { space: null })
+        .then((info) => { state.usage[id] = info; })
+        .catch((e) => { state.usage[id] = { error: e.message }; })
+        .finally(() => { if (--pending === 0 || pending % 5 === 0) flush(); });
+    }
+  }
+
+  function renderAdmin() {
+    const o = state.overview;
+    if (!o) return loading();
+    const pending = o.requests.filter((r) => r.status === 'pending').length;
+    const tab = state.adminTab;
+    const tabs = [['requests', 'Requests', pending], ['spaces', 'Spaces', o.spaces.length], ['demos', 'Demos', o.demos.length]];
+    const body = tab === 'spaces' ? adminSpaces(o) : tab === 'demos' ? adminDemos(o) : adminRequests(o);
+
+    $('#app').innerHTML = `
+      <header class="topbar">${brand()}<span class="chip admin hide-xs">Site admin</span><div class="spacer"></div>
+        <button class="btn ghost sm" data-action="admin-refresh" aria-label="Refresh">${I.refresh}<span class="hide-sm">Refresh</span></button>
+        <button class="btn primary sm" data-action="admin-new-space">${I.plus}<span class="hide-xs">New space</span></button>
+        <button class="btn ghost sm" data-action="admin-out">Sign out</button>
+      </header>
+      <main class="page admin">
+        <div class="tabs" role="tablist">
+          ${tabs.map(([k, label, n]) => `<button role="tab" class="tab ${tab === k ? 'active' : ''}" aria-selected="${tab === k}" data-action="admin-tab" data-tab="${k}">${label}${n ? `<span class="count ${k === 'requests' && n ? 'hot' : ''}">${n}</span>` : ''}</button>`).join('')}
+        </div>
+        ${body}
+      </main>`;
+  }
+
+  function usageLine(id) {
+    const u = state.usage[id];
+    if (!u) return '<span class="muted">Loading usage…</span>';
+    if (u.error) return `<span class="muted">${esc(u.error)}</span>`;
+    return `<span class="usage-line">${meter(u.usedBytes, u.quotaBytes)}${fmtBytes(u.usedBytes)} of ${fmtBytes(u.quotaBytes)} · ${plural(u.sections, 'section')}</span>`;
+  }
+
+  function adminRequests(o) {
+    if (!o.requests.length) return '<div class="empty"><h3>No requests yet</h3><p>Requests from the home page show up here.</p></div>';
+    return `<div class="cards">${o.requests.map((r) => `
+      <article class="rcard">
+        <div class="rc-main">
+          <div class="rc-title">${esc(r.name)} <span class="pill status-${esc(r.status)}">${esc(statusLabel(r.status))}</span></div>
+          <div class="rc-sub"><a href="mailto:${esc(r.email)}">${esc(r.email)}</a>${r.organization ? ` · ${esc(r.organization)}` : ''} · ${esc(ago(r.createdAt))}</div>
+          <p class="rc-text">${esc(r.purpose)}</p>
+          ${r.reason ? `<p class="rc-note">Reason given: ${esc(r.reason)}</p>` : ''}
+          ${r.status === 'approved' ? `<p class="rc-note"><a href="#/${esc(r.spaceId)}">Open space</a> · ${r.claimedAt ? 'requester collected the key' : 'key not collected yet'}</p>` : ''}
+        </div>
+        <div class="rc-actions">
+          ${r.status === 'pending'
+            ? `<button class="btn primary sm" data-action="approve" data-id="${esc(r.id)}">${I.check}Approve</button><button class="btn sm" data-action="reject" data-id="${esc(r.id)}">Reject</button>`
+            : `<button class="btn ghost sm danger" data-action="delete-request" data-id="${esc(r.id)}" title="Delete this record and its personal data">${I.trash}Delete record</button>`}
+        </div>
+      </article>`).join('')}</div>`;
+  }
+
+  function adminSpaces(o) {
+    if (!o.spaces.length) return `<div class="empty"><h3>No spaces yet</h3><p>Approve a request, or create a space yourself.</p><button class="btn primary" data-action="admin-new-space">${I.plus}New space</button></div>`;
+    return `<div class="cards">${o.spaces.map((s) => `
+      <article class="rcard">
+        <div class="rc-main">
+          <div class="rc-title">${esc(state.usage[s.id]?.title || s.title)}</div>
+          <div class="rc-sub">${s.owner ? esc(s.owner) : 'No owner'}${s.email ? ` · <a href="mailto:${esc(s.email)}">${esc(s.email)}</a>` : ''} · created ${esc(ago(s.createdAt))}</div>
+          <div class="rc-usage">${usageLine(s.id)}</div>
+        </div>
+        <div class="rc-actions">
+          <a class="btn sm" href="#/${esc(s.id)}">Open</a>
+          <button class="btn sm" data-action="space-keys" data-id="${esc(s.id)}">${I.key}Keys</button>
+          <button class="btn sm" data-action="space-quota" data-id="${esc(s.id)}">Storage</button>
+          <button class="btn sm" data-action="space-rotate" data-id="${esc(s.id)}">New key</button>
+          <button class="btn ghost sm danger" data-action="space-delete" data-id="${esc(s.id)}">${I.trash}Delete</button>
+        </div>
+      </article>`).join('')}</div>`;
+  }
+
+  function adminDemos(o) {
+    const head = `<div class="tab-head"><p class="muted">Demo spaces are deleted automatically ${o.settings.demo.hours} hours after they start (checked hourly).</p><button class="btn sm" data-action="cleanup">Run cleanup now</button></div>`;
+    if (!o.demos.length) return `${head}<div class="empty"><h3>No active demos</h3></div>`;
+    return `${head}<div class="cards">${o.demos.map((d) => `
+      <article class="rcard">
+        <div class="rc-main">
+          <div class="rc-title mono">${esc(d.id)}</div>
+          <div class="rc-sub">Started ${esc(ago(d.createdAt))} · ends in ${esc(timeLeft(d.expiresAt))}</div>
+          <div class="rc-usage">${usageLine(d.id)}</div>
+        </div>
+        <div class="rc-actions">
+          <a class="btn sm" href="#/${esc(d.id)}">Open</a>
+          <button class="btn ghost sm danger" data-action="space-delete" data-id="${esc(d.id)}">${I.trash}Delete</button>
+        </div>
+      </article>`).join('')}</div>`;
+  }
+
+  function showKeys(k, { name = '', title = '' } = {}) {
+    const open = `${SITE}#/${k.spaceId}`;
+    const reviewer = reviewLink(k.spaceId, k.reviewCode);
+    const message = `Hi${name ? ` ${name}` : ''},
+
+Your Review Desk space${title ? ` "${title}"` : ''} is ready.
+
+1. Open ${SITE} and paste your space key under "Have a key or link?":
+   ${k.adminKey}
+   Keep this key private: it gives full control of the space.
+
+2. Share this link with your reviewers:
+   ${reviewer}
+`;
+    modal({
+      title: 'Space keys',
+      html: `
+        ${copyField('Space key (owner)', k.adminKey, { secret: true })}
+        ${copyField('Reviewer link', reviewer)}
+        ${copyField('Review code', k.reviewCode)}
+        <div class="field"><label for="key-msg">Message to send the owner</label><textarea class="textarea mono sm-text" id="key-msg" rows="7" readonly>${esc(message)}</textarea></div>
+        <p class="muted">Send the key over a private channel. <a href="${esc(open)}">Open the space</a></p>`,
+      confirm: 'Copy message', cancelLabel: 'Done',
+      onSubmit: async () => { await copyText(message); return false; },
+    });
+  }
+
   /* ------------------------------------------------------------------ modal */
-  function modal({ title, text = '', fields = [], confirm = 'Save', danger = false, onSubmit }) {
+  // onSubmit may return false to keep the modal open.
+  function modal({ title, text = '', html = '', fields = [], confirm = 'Save', cancel = true, cancelLabel = 'Cancel', danger = false, onSubmit }) {
     const root = $('#modal-root');
     root.innerHTML = `
       <div class="modal-backdrop">
-        <form class="modal" novalidate>
-          <h3>${esc(title)}</h3>
+        <form class="modal" novalidate role="dialog" aria-modal="true" aria-labelledby="modal-title">
+          <h3 id="modal-title">${esc(title)}</h3>
           ${text ? `<p>${text}</p>` : ''}
+          ${html}
           ${fields.map((f, i) => `<div class="field">
             <label for="mf-${i}">${esc(f.label)}</label>
             ${f.multiline
               ? `<textarea class="textarea" id="mf-${i}" name="${f.name}" maxlength="${f.max || 1000}" placeholder="${esc(f.placeholder || '')}">${esc(f.value || '')}</textarea>`
-              : `<input class="input" id="mf-${i}" name="${f.name}" type="${f.type || 'text'}" maxlength="${f.max || 200}" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}" ${f.required ? 'required' : ''} autocomplete="off">`}
+              : `<input class="input" id="mf-${i}" name="${f.name}" type="${f.type || 'text'}" maxlength="${f.max || 200}" value="${esc(f.value ?? '')}" placeholder="${esc(f.placeholder || '')}" ${f.required ? 'required' : ''} ${f.type === 'number' ? 'inputmode="numeric" min="1"' : ''} autocomplete="${f.autocomplete || 'off'}">`}
+            ${f.hint ? `<small class="hint-text">${f.hint}</small>` : ''}
           </div>`).join('')}
           <div class="err" hidden></div>
           <div class="row">
-            <button type="button" class="btn ghost" data-close>Cancel</button>
+            ${cancel ? `<button type="button" class="btn ghost" data-close>${esc(cancelLabel)}</button>` : ''}
             <button type="submit" class="btn ${danger ? 'danger' : 'primary'}">${esc(confirm)}</button>
           </div>
         </form>
       </div>`;
     const form = $('form', root);
     const close = () => { root.innerHTML = ''; };
-    root.querySelector('[data-close]').onclick = close;
+    root.querySelector('[data-close]')?.addEventListener('click', close);
     root.querySelector('.modal-backdrop').onmousedown = (e) => { if (e.target === e.currentTarget) close(); };
     form.onkeydown = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
     form.onsubmit = async (e) => {
@@ -408,60 +970,139 @@
       const btn = form.querySelector('[type=submit]');
       btn.disabled = true;
       try {
-        await onSubmit(values);
-        close();
+        const keep = await onSubmit(values);
+        if (keep === false) btn.disabled = false; else if (root.contains(form)) close();
       } catch (ex) {
         err.textContent = ex.message; err.hidden = false; btn.disabled = false;
       }
     };
-    (form.querySelector('input,textarea') || form.querySelector('[type=submit]')).focus();
+    if (!coarse) (form.querySelector('input:not([readonly]),textarea:not([readonly])') || form.querySelector('[type=submit]')).focus();
   }
   const confirmBox = (title, text, confirm, onSubmit) => modal({ title, text, confirm, danger: true, onSubmit });
 
   /* ---------------------------------------------------------------- actions */
+  const findReq = (id) => state.overview.requests.find((r) => r.id === id);
+
   const actions = {
+    // navigation
     'open-section': (el) => go(el.dataset.sid),
     'open-image': (el) => go(currentSection().id, el.dataset.iid),
     'close-viewer': () => go(state.route.sid),
     'nav-image': (el) => navImage(Number(el.dataset.dir)),
+    'reload': () => location.reload(),
     'refresh': () => load().then(() => toast('Up to date')),
+    'menu': () => { state.menuOpen = !state.menuOpen; render(); },
+    'copy': (el) => copyText(el.dataset.text),
+
+    // home
+    'start-demo': () => run(async () => {
+      const d = await api('POST', '/api/demo', undefined, { space: null });
+      creds.set(d.spaceId, { key: d.adminKey, code: d.reviewCode, title: d.space.title, kind: 'demo', expiresAt: d.space.expiresAt });
+      store.set('demo', d.spaceId);
+      state.welcome = d.spaceId;
+      nav(spaceHash(d.spaceId));
+    }),
+    'request-space': () => modal({
+      title: 'Request a space',
+      text: 'Tell us a little about your project. An admin reviews each request; this browser gets a status page that shows your space key once it’s approved.',
+      fields: [
+        { name: 'name', label: 'Your name', required: true, max: 80, autocomplete: 'name' },
+        { name: 'email', label: 'Email', type: 'email', required: true, max: 200, autocomplete: 'email', hint: 'Only used to contact you about this request.' },
+        { name: 'organization', label: 'Company or team (optional)', max: 120, autocomplete: 'organization' },
+        { name: 'purpose', label: 'What will you review?', multiline: true, max: 1000, required: true, placeholder: 'e.g. App redesign for a client, around 60 screens over two months' },
+      ],
+      confirm: 'Send request',
+      onSubmit: async (v) => {
+        const r = await api('POST', '/api/requests', v, { space: null });
+        saveRequests([...myRequests(), { id: r.id, token: r.token, createdAt: new Date().toISOString(), lastStatus: 'pending' }]);
+        nav(`#/r/${r.id}`);
+      },
+    }),
+    'check-request': () => openRequest(state.request.id),
+    'drop-request': (el) => { saveRequests(myRequests().filter((r) => r.id !== el.dataset.id)); nav('#/'); },
+    'forget-space': (el) => {
+      const id = el.dataset.id;
+      const c = creds.get(id);
+      const doIt = () => { creds.forget(id); if (store.get('demo') === id) store.set('demo', null); if (state.route.view === 'space') nav('#/'); else render(); };
+      if (c.key && c.kind !== 'demo') {
+        confirmBox('Forget this space?', 'Your space key will be removed from this browser. Make sure you’ve saved it somewhere, or you won’t be able to manage the space.', 'Forget', doIt);
+      } else doIt();
+    },
+
+    // space
+    'share': () => {
+      const code = spaceCode();
+      const demo = state.project.space.kind === 'demo';
+      modal({
+        title: 'Invite reviewers',
+        html: `<p>Anyone with this link can view the screenshots and comment. They don’t need an account.</p>
+          ${copyField('Reviewer link', reviewLink(spaceId(), code))}
+          ${copyField('Review code', code)}
+          ${demo ? `<p class="muted">The link stops working when the demo ends, in ${timeLeft(state.project.space.expiresAt)}.</p>` : ''}
+          <p class="muted">Need to cut off access? Use <b>New review code</b> in the ⋯ menu; old links stop working.</p>`,
+        confirm: 'Copy link', cancelLabel: 'Close',
+        onSubmit: async () => { await copyText(reviewLink(spaceId(), code)); return false; },
+      });
+    },
+    'rotate-code': () => confirmBox('Create a new review code?', 'Everyone using the current link or code loses access until you send them the new one.', 'New code', async () => {
+      const r = await api('POST', `/api/s/${spaceId()}/rotate-code`);
+      state.me.reviewCode = r.reviewCode;
+      if (creds.get(spaceId()).key) creds.set(spaceId(), { code: r.reviewCode });
+      state.menuOpen = false;
+      render();
+      actions.share();
+    }),
+    'owner-in': () => modal({
+      title: 'Owner sign-in', text: 'Paste the space key you received when this space was created.',
+      fields: [{ name: 'key', label: 'Space key', type: 'password', required: true, max: 200, placeholder: 'sk-…' }],
+      confirm: 'Sign in',
+      onSubmit: async ({ key }) => {
+        key = key.trim();
+        const m = key.match(KEY_RE);
+        if (!m) throw new Error('That doesn’t look like a space key. It starts with “sk-”.');
+        if (m[1] !== spaceId()) throw new Error('That key belongs to a different space.');
+        const prev = creds.get(spaceId()).key || null;
+        creds.set(spaceId(), { key });
+        const me = await api('GET', `/api/s/${spaceId()}/me`).catch((e) => { creds.set(spaceId(), { key: prev }); throw e; });
+        if (!me.admin) { creds.set(spaceId(), { key: prev }); throw new Error('That key is not correct.'); }
+        state.me = me;
+        creds.set(spaceId(), { code: me.reviewCode });
+        state.menuOpen = false;
+        render();
+        toast('Signed in as owner');
+      },
+    }),
+    'owner-out': () => { creds.set(spaceId(), { key: null }); state.menuOpen = false; openSpace(spaceId()); },
+    'delete-demo': () => confirmBox('Delete this demo now?', 'All sections, screenshots and comments in this demo are deleted for everyone. This can’t be undone.', 'Delete demo', async () => {
+      await api('DELETE', `/api/s/${spaceId()}`);
+      creds.forget(spaceId());
+      store.set('demo', null);
+      nav('#/');
+      toast('Demo deleted');
+    }),
     'toggle-fit': () => { store.set('fit', store.get('fit') === '0' ? '1' : '0'); render(); },
     'toggle-resolved': (el) => { state.showResolved[el.dataset.target] = !state.showResolved[el.dataset.target]; render(); },
-    'reply': (el) => { state.replyTo = el.dataset.cid; render(); document.querySelector(`.reply-box textarea`)?.focus(); },
+    'reply': (el) => { state.replyTo = el.dataset.cid; render(); document.querySelector('.reply-box textarea')?.focus(); },
     'cancel-reply': () => { state.replyTo = null; render(); },
     'clear-pin': () => { state.pinDraft = null; render(); },
     'focus-comment': (el) => {
       const t = document.querySelector(`.thread[data-cid="${el.dataset.cid}"]`);
       if (t) { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); setHighlight(el.dataset.cid); }
     },
-    'copy-link': async (el) => {
-      const url = `${location.origin}${location.pathname}#/s/${el.dataset.sid}${el.dataset.iid ? `/i/${el.dataset.iid}` : ''}`;
-      try { await navigator.clipboard.writeText(url); toast('Link copied'); } catch { prompt('Copy this link:', url); }
-    },
+    'copy-link': (el) => copyText(reviewLink(spaceId(), spaceCode(), `/s/${el.dataset.sid}${el.dataset.iid ? `/i/${el.dataset.iid}` : ''}`)),
     'change-name': () => modal({
       title: 'Your name', text: 'Shown next to the comments you post.',
-      fields: [{ name: 'name', label: 'Name', value: state.name, required: true, max: 60 }],
-      onSubmit: ({ name }) => { setName(name); render(); },
+      fields: [{ name: 'name', label: 'Name', value: state.name, required: true, max: 60, autocomplete: 'name' }],
+      onSubmit: ({ name }) => { setName(name); state.menuOpen = false; render(); },
     }),
-    'admin-in': () => modal({
-      title: 'Team sign-in', text: 'Enter the admin key to upload screenshots and manage comments.',
-      fields: [{ name: 'key', label: 'Admin key', type: 'password', required: true, max: 200 }],
-      confirm: 'Sign in',
-      onSubmit: async ({ key }) => {
-        const prev = state.adminKey;
-        state.adminKey = key.trim();
-        const me = await api('GET', '/api/me').catch((e) => { state.adminKey = prev; throw e; });
-        if (!me.admin) { state.adminKey = prev; throw new Error('That key is not correct.'); }
-        state.me = me;
-        store.set('adminKey', state.adminKey);
-        render();
-        toast('Signed in as admin');
-      },
-    }),
-    'admin-out': () => { state.adminKey = ''; store.set('adminKey', null); state.me.admin = false; render(); },
     'rename-project': () => modal({
-      title: 'Rename project', fields: [{ name: 'title', label: 'Project title', value: state.project.title, required: true, max: 120 }],
-      onSubmit: async ({ title }) => { state.project = await api('PATCH', '/api/project', { title }); document.title = state.project.title; render(); },
+      title: 'Rename space', fields: [{ name: 'title', label: 'Space name', value: state.project.title, required: true, max: 120 }],
+      onSubmit: async ({ title }) => {
+        state.project = await api('PATCH', `/api/s/${spaceId()}/project`, { title });
+        document.title = `${state.project.title} · Review Desk`;
+        if (creds.get(spaceId()).key) creds.set(spaceId(), { title: state.project.title });
+        render();
+      },
     }),
     'new-section': () => modal({
       title: 'New section', text: 'A section groups related screenshots — a feature, a flow or a screen.',
@@ -470,7 +1111,7 @@
         { name: 'description', label: 'Description (optional)', placeholder: 'What should reviewers focus on?', multiline: true },
       ],
       confirm: 'Create',
-      onSubmit: async (v) => { const s = await api('POST', '/api/sections', v); applySection(s); go(s.id); },
+      onSubmit: async (v) => { const s = await api('POST', `/api/s/${spaceId()}/sections`, v); applySection(s); go(s.id); },
     }),
     'edit-section': () => {
       const s = currentSection();
@@ -480,13 +1121,13 @@
           { name: 'title', label: 'Title', value: s.title, required: true, max: 120 },
           { name: 'description', label: 'Description', value: s.description, multiline: true },
         ],
-        onSubmit: async (v) => { applySection(await api('PATCH', `/api/sections/${s.id}`, v)); render(); },
+        onSubmit: async (v) => { applySection(await api('PATCH', `/api/s/${spaceId()}/sections/${s.id}`, v)); render(); },
       });
     },
     'delete-section': () => {
       const s = currentSection();
-      confirmBox('Delete section?', `“${esc(s.title)}”, its ${plural(s.images.length, 'screenshot')} and ${plural(s.comments.length, 'comment')} will be removed. The files stay in your repo's git history.`, 'Delete section', async () => {
-        await api('DELETE', `/api/sections/${s.id}`);
+      confirmBox('Delete section?', `“${esc(s.title)}”, its ${plural(s.images.length, 'screenshot')} and ${plural(s.comments.length, 'comment')} will be removed.`, 'Delete section', async () => {
+        await api('DELETE', `/api/s/${spaceId()}/sections/${s.id}`);
         state.project.sections = state.project.sections.filter((x) => x.id !== s.id);
         go(state.project.sections[0]?.id || null);
         toast('Section deleted');
@@ -497,7 +1138,7 @@
       const img = s.images.find((i) => i.id === state.route.iid);
       modal({
         title: 'Edit caption', fields: [{ name: 'caption', label: 'Caption', value: img.caption, placeholder: img.name, max: 200 }],
-        onSubmit: async (v) => { applySection(await api('PATCH', `/api/sections/${s.id}/images/${img.id}`, v)); render(); },
+        onSubmit: async (v) => { applySection(await api('PATCH', `/api/s/${spaceId()}/sections/${s.id}/images/${img.id}`, v)); render(); },
       });
     },
     'delete-image': () => {
@@ -506,20 +1147,111 @@
       const n = s.comments.filter((c) => c.target === img.id).length;
       confirmBox('Delete screenshot?', `This removes the screenshot${n ? ` and its ${plural(n, 'comment')}` : ''}.`, 'Delete', async () => {
         const idx = s.images.indexOf(img);
-        applySection(await api('DELETE', `/api/sections/${s.id}/images/${img.id}`));
+        applySection(await api('DELETE', `/api/s/${spaceId()}/sections/${s.id}/images/${img.id}`));
         const next = currentSection().images[Math.min(idx, currentSection().images.length - 1)];
         go(s.id, next?.id);
       });
     },
     'resolve': (el) => run(async () => {
-      applySection(await api('PATCH', `/api/sections/${currentSection().id}/comments/${el.dataset.cid}`, { resolved: el.dataset.val === '1' }));
+      applySection(await api('PATCH', `/api/s/${spaceId()}/sections/${currentSection().id}/comments/${el.dataset.cid}`, { resolved: el.dataset.val === '1' }));
       render();
     }),
     'delete-comment': (el) => confirmBox('Delete comment?', 'Replies to it are deleted too.', 'Delete', async () => {
-      applySection(await api('DELETE', `/api/sections/${currentSection().id}/comments/${el.dataset.cid}`));
+      applySection(await api('DELETE', `/api/s/${spaceId()}/sections/${currentSection().id}/comments/${el.dataset.cid}`));
       render();
     }),
     'pick-files': () => $('#file-input')?.click(),
+
+    // site admin
+    'admin-tab': (el) => { state.adminTab = el.dataset.tab; render(); },
+    'admin-refresh': () => openAdmin(),
+    'admin-out': () => { state.siteKey = ''; store.set('siteKey', null); nav('#/'); },
+    'approve': (el) => {
+      const r = findReq(el.dataset.id);
+      modal({
+        title: `Approve ${r.name}’s request`,
+        text: 'This creates their space. You’ll see the keys next; the requester can also collect them once from their status page.',
+        fields: [
+          { name: 'title', label: 'Space name', value: r.organization || `${r.name}’s space`, required: true, max: 120 },
+          { name: 'quotaMb', label: 'Storage (MB)', type: 'number', value: Math.round(state.overview.settings.spaceQuotaBytes / 1048576), required: true, max: 6 },
+        ],
+        confirm: 'Approve',
+        onSubmit: async (v) => {
+          const k = await api('POST', `/api/admin/requests/${r.id}/approve`, v, { space: null });
+          await openAdmin();
+          showKeys(k, { name: r.name, title: v.title });
+          return false;
+        },
+      });
+    },
+    'reject': (el) => {
+      const r = findReq(el.dataset.id);
+      modal({
+        title: `Reject ${r.name}’s request?`,
+        fields: [{ name: 'reason', label: 'Reason (optional, shown to the requester)', multiline: true, max: 500 }],
+        confirm: 'Reject', danger: true,
+        onSubmit: async (v) => { await api('POST', `/api/admin/requests/${r.id}/reject`, v, { space: null }); await openAdmin(); },
+      });
+    },
+    'delete-request': (el) => confirmBox('Delete this request record?', 'The requester’s name, email and message are removed. An approved space is not affected.', 'Delete record', async () => {
+      await api('DELETE', `/api/admin/requests/${el.dataset.id}`, undefined, { space: null });
+      await openAdmin();
+    }),
+    'admin-new-space': () => modal({
+      title: 'New space', text: 'Create a space directly, without a request.',
+      fields: [
+        { name: 'title', label: 'Space name', required: true, max: 120 },
+        { name: 'owner', label: 'Owner name (optional)', max: 80 },
+        { name: 'email', label: 'Owner email (optional)', type: 'email', max: 200 },
+        { name: 'quotaMb', label: 'Storage (MB)', type: 'number', value: Math.round((state.overview?.settings.spaceQuotaBytes || 209715200) / 1048576), required: true, max: 6 },
+      ],
+      confirm: 'Create',
+      onSubmit: async (v) => {
+        const k = await api('POST', '/api/admin/spaces', v, { space: null });
+        state.adminTab = 'spaces';
+        await openAdmin();
+        showKeys(k, { name: v.owner, title: v.title });
+        return false;
+      },
+    }),
+    'space-keys': (el) => run(async () => {
+      const k = await api('GET', `/api/admin/spaces/${el.dataset.id}/keys`, undefined, { space: null });
+      const s = state.overview.spaces.find((x) => x.id === el.dataset.id);
+      showKeys(k, { name: s?.owner, title: s?.title });
+    }),
+    'space-quota': (el) => {
+      const u = state.usage[el.dataset.id];
+      modal({
+        title: 'Change storage',
+        text: u && !u.error ? `Currently ${fmtBytes(u.usedBytes)} of ${fmtBytes(u.quotaBytes)} used.` : '',
+        fields: [{ name: 'quotaMb', label: 'Storage (MB)', type: 'number', value: u?.quotaBytes ? Math.round(u.quotaBytes / 1048576) : '', required: true, max: 6 }],
+        onSubmit: async (v) => {
+          state.usage[el.dataset.id] = await api('PATCH', `/api/admin/spaces/${el.dataset.id}`, v, { space: null });
+          render();
+        },
+      });
+    },
+    'space-rotate': (el) => confirmBox('Issue a new space key?', 'The current key stops working within a minute. You’ll need to send the new key to the owner.', 'New key', async () => {
+      const k = await api('POST', `/api/admin/spaces/${el.dataset.id}/rotate-key`, undefined, { space: null });
+      const s = state.overview.spaces.find((x) => x.id === el.dataset.id);
+      showKeys(k, { name: s?.owner, title: s?.title });
+      return false;
+    }),
+    'space-delete': (el) => {
+      const id = el.dataset.id;
+      const title = state.usage[id]?.title || state.overview.spaces.find((x) => x.id === id)?.title || id;
+      confirmBox('Delete this space?', `“${esc(title)}” and all its screenshots and comments are deleted for everyone. This can’t be undone from here.`, 'Delete space', async () => {
+        await api('DELETE', `/api/admin/spaces/${id}`, undefined, { space: null });
+        creds.forget(id);
+        await openAdmin();
+        toast('Space deleted');
+      });
+    },
+    'cleanup': () => run(async () => {
+      const r = await api('POST', '/api/admin/cleanup', undefined, { space: null });
+      await openAdmin();
+      toast(r.removedSpaces ? `Removed ${plural(r.removedSpaces, 'expired demo')}` : 'Nothing to clean up');
+    }),
   };
 
   function setName(name) {
@@ -559,7 +1291,7 @@
     const btn = form.querySelector('[type=submit]');
     btn.disabled = true;
     const ok = await run(async () => {
-      applySection(await api('POST', `/api/sections/${s.id}/comments`, body));
+      applySection(await api('POST', `/api/s/${spaceId()}/sections/${s.id}/comments`, body));
       return true;
     });
     btn.disabled = false;
@@ -584,7 +1316,9 @@
     const t = toast(`Uploading 1 of ${images.length}…`);
     for (const file of images) {
       t.textContent = `Uploading ${done + 1} of ${images.length}…`;
+      const left = state.project.space.quotaBytes - usedBytes();
       if (file.size > MAX_UPLOAD) { toast(`${file.name} is over 15 MB — skipped`, 'error'); continue; }
+      if (file.size > left) { toast(`${file.name} (${fmtBytes(file.size)}) doesn’t fit: ${fmtBytes(Math.max(0, left))} of storage left`, 'error'); continue; }
       try {
         const data = await new Promise((resolve, reject) => {
           const r = new FileReader();
@@ -594,7 +1328,7 @@
         });
         const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }[file.type];
         const filename = /\.[a-z0-9]+$/i.test(file.name) ? file.name : `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${ext}`;
-        applySection(await api('POST', `/api/sections/${s.id}/images`, { filename, data }));
+        applySection(await api('POST', `/api/s/${spaceId()}/sections/${s.id}/images`, { filename, data }));
         done++;
         render();
       } catch (e) {
@@ -607,12 +1341,15 @@
 
   /* ----------------------------------------------------------------- events */
   document.addEventListener('click', (e) => {
+    if (state.menuOpen && !e.target.closest('.menu-wrap')) { state.menuOpen = false; render(); }
     const el = e.target.closest('[data-action]');
     if (el && el.tagName !== 'FORM' && actions[el.dataset.action]) {
       e.preventDefault();
+      if (el.closest('.menu')) { state.menuOpen = false; $('.menu')?.remove(); }
       actions[el.dataset.action](el);
       return;
     }
+    if (e.target.closest('.menu a')) { state.menuOpen = false; return; }
     // Click on the screenshot drops a pin.
     const canvas = e.target.closest('#canvas');
     if (canvas && e.target.tagName === 'IMG') {
@@ -623,18 +1360,23 @@
       };
       state.replyTo = null;
       render();
-      document.querySelector('.panel-foot textarea')?.focus();
+      const ta = document.querySelector('.panel-foot textarea');
+      if (ta) { ta.focus({ preventScroll: true }); if (coarse) ta.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
     }
   });
 
   document.addEventListener('submit', (e) => {
     const form = e.target.closest('form[data-action="post"]');
-    if (form) { e.preventDefault(); postComment(form); }
+    if (form) { e.preventDefault(); postComment(form); return; }
+    if (e.target.matches('[data-form="open"]')) { e.preventDefault(); openFromInput(e.target.value.value); }
   });
 
   document.addEventListener('input', (e) => {
     if (e.target.dataset.draft) state.drafts[e.target.dataset.draft] = e.target.value;
   });
+
+  // Select the whole value of a copy field on focus, so it's easy to copy by hand.
+  document.addEventListener('focusin', (e) => { if (e.target.matches?.('.copy-field input')) e.target.select(); });
 
   document.addEventListener('keydown', (e) => {
     if (e.target.matches?.('textarea[data-draft]') && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -642,6 +1384,7 @@
       e.target.form.requestSubmit();
       return;
     }
+    if (e.key === 'Escape' && state.menuOpen) { state.menuOpen = false; render(); return; }
     if ($('#modal-root').innerHTML || !state.route.iid) return;
     if (e.target.matches?.('input, textarea')) {
       if (e.key === 'Escape') e.target.blur();
@@ -653,6 +1396,7 @@
   });
 
   document.addEventListener('mouseover', (e) => {
+    if (coarse) return;
     const el = e.target.closest('.thread[data-cid], .pin[data-cid]');
     setHighlight(el ? el.dataset.cid : null);
   });
@@ -676,7 +1420,7 @@
     uploadFiles(e.dataTransfer.files);
   });
   document.addEventListener('paste', (e) => {
-    if (!isAdmin() || state.route.iid || e.target.matches?.('input, textarea')) return;
+    if (!isAdmin() || state.route.view !== 'space' || state.route.iid || e.target.matches?.('input, textarea')) return;
     const files = [...(e.clipboardData?.files || [])];
     if (files.length) { e.preventDefault(); uploadFiles(files); }
   });
@@ -688,51 +1432,23 @@
   });
 
   /* ------------------------------------------------------------------- boot */
-  function gate(message) {
-    $('#app').innerHTML = `
-      <div class="gate">
-        <form class="modal" id="gate-form">
-          <div class="brand"><div class="brand-mark">${I.logo}</div><span>Design Review</span></div>
-          <h3>Enter the review code</h3>
-          <p>You should have received it with the link to this page.</p>
-          <div class="field"><label for="gate-code">Review code</label><input class="input" id="gate-code" autocomplete="off" required></div>
-          ${message ? `<div class="err">${esc(message)}</div>` : ''}
-          <div class="row"><button class="btn primary" type="submit">Continue</button></div>
-        </form>
-      </div>`;
-    $('#gate-code').focus();
-    $('#gate-form').onsubmit = (e) => {
-      e.preventDefault();
-      state.code = $('#gate-code').value.trim();
-      store.set('code', state.code);
-      boot(true);
-    };
-  }
-
-  function fatal(title, detail) {
-    $('#app').innerHTML = `<div class="gate"><div class="modal"><h3>${esc(title)}</h3><p>${detail}</p></div></div>`;
-  }
-
-  async function boot(fromGate = false) {
+  function boot() {
     if (!API || API.includes('YOUR-SUBDOMAIN')) {
-      return fatal('Almost there', 'Set <code>apiUrl</code> in <code>config.js</code> to your Cloudflare Worker URL, then reload.');
+      $('#app').innerHTML = '<div class="boot">Set <code>apiUrl</code> in <code>config.js</code> to your Cloudflare Worker URL, then reload.</div>';
+      return;
     }
-    // A review code can be shared in the link: …/#/s/abc?code=XYZ or ?code=XYZ
-    const urlCode = new URLSearchParams(location.search).get('code');
-    if (urlCode) {
-      state.code = urlCode; store.set('code', urlCode);
-      history.replaceState(null, '', location.pathname + location.hash);
+    // A review code can be shared in the link: …/?code=XYZ#/<space>
+    const params = new URLSearchParams(location.search);
+    const urlCode = params.get('code');
+    const r = parseRoute();
+    if (urlCode && r.view === 'space') creds.set(r.space, { code: urlCode });
+    if (urlCode || params.has('admin')) {
+      history.replaceState(null, '', location.pathname + (params.has('admin') ? '#/admin' : location.hash));
     }
-    try {
-      state.me = await api('GET', '/api/me');
-    } catch (e) {
-      return fatal('Can’t reach the review server', esc(e.message));
-    }
-    if (state.adminKey && !state.me.admin) { state.adminKey = ''; store.set('adminKey', null); }
-    if (!state.me.authorized) return gate(fromGate || state.code ? 'That code didn’t work. Please check it and try again.' : '');
-    parseRoute();
-    await load();
-    if (new URLSearchParams(location.search).has('admin') && !isAdmin()) actions['admin-in']();
+    api('GET', '/api/config', undefined, { space: null })
+      .then((c) => { state.config = c; if (state.route.view === 'home') render(); })
+      .catch(() => {});
+    route();
   }
 
   boot();

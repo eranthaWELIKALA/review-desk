@@ -2,20 +2,35 @@ name = "screenshot-review-api"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
+# Hourly: delete demo spaces older than DEMO_HOURS (free plan includes cron triggers).
+[triggers]
+crons = ["17 * * * *"]
+
 [vars]
-# The repo that stores screenshots and comments (can be the same repo as the site).
+# The private repo that stores screenshots, comments and space requests.
 GITHUB_OWNER = "eranthaWELIKALA"
 GITHUB_REPO = "review-desk-data"
-# Branch for review data. Keep it separate from the Pages branch so uploads
-# don't trigger a Pages rebuild. Create it once before first use (see README).
+# Approved spaces live here. Create it once before first use (see README).
 GITHUB_BRANCH = "review-data"
-# Your GitHub Pages origin, e.g. "https://your-username.github.io". Comma-separate several.
+# Demo spaces live here; the Worker creates it on first use and rewrites it
+# without history during cleanup, so deleted demos don't linger in git.
+DEMO_BRANCH = "demo-data"
+# Your GitHub Pages origin. Comma-separate several.
 ALLOWED_ORIGINS = "https://eranthawelikala.github.io"
-# "true"  = images load straight from raw.githubusercontent.com (public repo only, faster)
-# "false" = images are served through this Worker (works with private repos)
-PUBLIC_IMAGES = "false"
+
+# Demo spaces: anyone can start one, no account.
+DEMO_ENABLED = "true"
+DEMO_QUOTA_MB = "5"
+DEMO_HOURS = "24"
+DEMO_MAX_ACTIVE = "30"        # across all visitors
+DEMO_PER_IP_PER_DAY = "3"
+
+# Approved spaces: default storage (the admin can change it per space).
+SPACE_QUOTA_MB = "200"
+MAX_PENDING_REQUESTS = "50"
 
 # Secrets — set with `npx wrangler secret put <NAME>`, never commit them:
-#   GITHUB_TOKEN  fine-grained token, this repo only, Contents: Read and write
-#   ADMIN_KEY     long random string; lets you create sections, upload, resolve, delete
-#   REVIEW_CODE   optional; if set, clients must enter it before viewing or commenting
+#   GITHUB_TOKEN  fine-grained token, data repo only, Contents: Read and write
+#   ADMIN_KEY     long random string; the site admin console (#/admin)
+#   SPACE_SECRET  long random string; space keys and review codes are derived from it.
+#                 Changing it invalidates every space key and review code at once.
