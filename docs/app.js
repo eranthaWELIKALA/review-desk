@@ -23,6 +23,14 @@
     setJson(k, v) { this.set(k, v == null ? null : JSON.stringify(v)); },
   };
 
+  // The site admin key lives only in this tab's sessionStorage, so it is gone when
+  // the tab closes and never sits in long-lived storage on a shared origin.
+  const session = {
+    get(k) { try { return sessionStorage.getItem('rd:' + k); } catch { return null; } },
+    set(k, v) { try { v == null ? sessionStorage.removeItem('rd:' + k) : sessionStorage.setItem('rd:' + k, v); } catch { /* private mode */ } },
+  };
+  store.set('siteKey', null); // purge the copy older versions kept in localStorage
+
   // Keys and review codes per space, remembered on this device only.
   const creds = {
     all() { return store.json('spaces') || {}; },
@@ -44,7 +52,7 @@
     config: null,
     me: null,
     project: null,
-    siteKey: store.get('siteKey') || '',
+    siteKey: session.get('siteKey') || '',
     overview: null,
     usage: {},           // space id -> admin info (usage), loaded lazily
     adminTab: 'requests',
@@ -779,7 +787,7 @@
     try {
       state.overview = await api('GET', '/api/admin/overview', undefined, { space: null });
     } catch (e) {
-      if (e.status === 403) { state.siteKey = ''; store.set('siteKey', null); return adminGate('That key is not correct.'); }
+      if (e.status === 403) { state.siteKey = ''; session.set('siteKey', null); return adminGate('That key is not correct.'); }
       return notice({ title: 'Can’t load the admin console', text: esc(e.message), actions: '<button class="btn" data-action="reload">Try again</button>' });
     }
     state.usage = {};
@@ -802,7 +810,7 @@
       const key = $('#admin-key').value.trim();
       if (!key) return;
       state.siteKey = key;
-      store.set('siteKey', key);
+      session.set('siteKey', key);
       openAdmin();
     };
   }
@@ -1165,7 +1173,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     // site admin
     'admin-tab': (el) => { state.adminTab = el.dataset.tab; render(); },
     'admin-refresh': () => openAdmin(),
-    'admin-out': () => { state.siteKey = ''; store.set('siteKey', null); nav('#/'); },
+    'admin-out': () => { state.siteKey = ''; session.set('siteKey', null); nav('#/'); },
     'approve': (el) => {
       const r = findReq(el.dataset.id);
       modal({

@@ -1,3 +1,9 @@
 node_modules/
 dev/.data/
 .wrangler/
+
+# Secrets: never commit. Use `wrangler secret put` for deployed values.
+.dev.vars
+.env*
+*.secret*
+worker/*.txt
