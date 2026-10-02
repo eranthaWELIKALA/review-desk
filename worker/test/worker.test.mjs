@@ -1,87 +1,54 @@
-// Runs the Worker against an in-memory fake of the GitHub API.
+// Core flows: requests, spaces, sections, screenshots, comments, demos, security.
 //   cd worker && npm test
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import worker from '../worker.js';
-import { createFakeGitHub, installFakeGitHub } from '../../dev/fake-github.mjs';
+import { setup, user, PNG, pngBody } from './helpers.mjs';
 
-const baseEnv = {
-  GITHUB_TOKEN: 't', GITHUB_OWNER: 'o', GITHUB_REPO: 'r', GITHUB_BRANCH: 'review-data',
-  ADMIN_KEY: 'admin-secret', SPACE_SECRET: 'space-secret', ALLOWED_ORIGINS: 'https://x.github.io',
-  DEMO_QUOTA_MB: '0.001', // 1 KB-ish, so tests can fill it
-  // The in-memory rate limits are shared by every call in a test; keep them out of the way.
-  RATE_AUTH_PER_MIN: '100000', RATE_WRITES_PER_MIN: '100000',
-};
-
-function setup(extraEnv = {}) {
-  const gh = createFakeGitHub();
-  const restore = installFakeGitHub(gh);
-  const env = { ...baseEnv, ...extraEnv };
-  async function call(method, path, { body, site, session, key, code, ip = '1.1.1.1', headers: extra = {} } = {}) {
-    const headers = { Origin: 'https://x.github.io', 'Content-Type': 'application/json', 'CF-Connecting-IP': ip, ...extra };
-    // `site: true` signs in as site admin first (a fresh session each time, so faked clocks work).
-    if (site) session = (await call('POST', '/api/admin/session', { body: { key: 'admin-secret' }, ip })).data.session;
-    if (session) headers['X-Admin-Session'] = session;
-    if (key) headers['X-Space-Key'] = key;
-    if (code) headers['X-Review-Code'] = code;
-    const res = await worker.fetch(new Request(`https://w.dev${path}`, {
-      method, headers, body: typeof body === 'string' || body instanceof ReadableStream ? body : body ? JSON.stringify(body) : undefined,
-      ...(body instanceof ReadableStream ? { duplex: 'half' } : {}),
-    }), env);
-    const type = res.headers.get('Content-Type') || '';
-    return { status: res.status, headers: res.headers, data: type.includes('json') ? await res.json() : await res.arrayBuffer() };
-  }
-  return { gh, env, call, restore };
-}
-
-const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
-const pngBody = (filename = 'Login Screen.PNG', extra = {}) => ({ filename, data: 'data:image/png;base64,' + PNG.toString('base64'), ...extra });
-
-test('request → approve → collect keys → review flow', async () => {
-  const { gh, call, restore } = setup();
+test('request → approve → owner account → review flow', async () => {
+  const { gh, call, sent, restore } = setup();
+  const nimal = user('nimal');
   try {
-    // A visitor asks for a space.
-    let r = await call('POST', '/api/requests', { body: { name: 'Nimal', email: 'not-an-email', purpose: 'x' } });
-    assert.equal(r.status, 400);
-    r = await call('POST', '/api/requests', { body: { name: 'Nimal', email: 'nimal@example.com', organization: 'Mango', purpose: 'Sprint reviews' } });
+    // Requests need an account; name and email come from it.
+    let r = await call('POST', '/api/requests', { body: { organization: 'Mango', purpose: 'Sprint reviews' } });
+    assert.equal(r.status, 401);
+    r = await call('POST', '/api/requests', { as: nimal, body: { organization: 'Mango', purpose: 'Sprint reviews' } });
     assert.equal(r.status, 201);
-    const { id: rid, token } = r.data;
+    const rid = r.data.id;
+    r = await call('GET', '/api/me', { as: nimal });
+    assert.deepEqual(r.data.requests.map((x) => [x.id, x.status]), [[rid, 'pending']]);
 
-    r = await call('POST', `/api/requests/${rid}/status`, { body: { token: 'wrong' } });
-    assert.equal(r.status, 404, 'status needs the token');
-    r = await call('POST', `/api/requests/${rid}/status`, { body: { token } });
-    assert.equal(r.data.status, 'pending');
-
-    // Only the site admin sees and decides requests; tokens and IP hashes never leave the Worker.
-    r = await call('GET', '/api/admin/overview');
+    // Only the site admin sees and decides requests; IP hashes never leave the Worker.
+    r = await call('GET', '/api/admin/overview', { as: nimal });
     assert.equal(r.status, 403);
     r = await call('GET', '/api/admin/overview', { site: true });
     assert.equal(r.data.requests[0].email, 'nimal@example.com');
-    assert.equal(r.data.requests[0].tokenHash, undefined);
     assert.equal(r.data.requests[0].ipHash, undefined);
 
     r = await call('POST', `/api/admin/requests/${rid}/approve`, { site: true, body: { quotaMb: 1 } });
     assert.equal(r.status, 201);
-    const { spaceId, adminKey, reviewCode } = r.data;
+    const { spaceId, reviewCode } = r.data;
     assert.match(spaceId, /^s[a-z0-9]+$/);
-    assert.match(adminKey, new RegExp(`^sk-${spaceId}-[A-Za-z0-9_-]{22}$`));
+    assert.equal(r.data.adminKey, undefined, 'no space key for account-owned spaces');
+    assert.equal(r.data.owner, 'nimal@example.com');
+    assert.equal(r.data.emailed, false, 'email is off without RESEND_API_KEY');
     assert.match(reviewCode, /^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/, '12-character review codes');
     assert.equal(r.data.space.title, 'Mango');
     r = await call('POST', `/api/admin/requests/${rid}/approve`, { site: true, body: {} });
     assert.equal(r.status, 409, 'cannot approve twice');
+    assert.equal(sent.length, 0);
+
+    // The requester is now the owner.
+    r = await call('GET', '/api/me', { as: nimal });
+    assert.deepEqual(r.data.spaces, [{ id: spaceId, title: 'Mango', role: 'owner' }]);
+    assert.equal(r.data.requests[0].status, 'approved');
+    const { data: keys } = await call('GET', `/api/admin/spaces/${spaceId}/keys`, { site: true });
+    const adminKey = keys.adminKey; // still exists for spaces made before accounts
 
     // No secrets are written to the repo.
     const repoText = Object.values(gh.files()).map(String).join('\n');
     assert.ok(!repoText.includes(adminKey) && !repoText.includes(reviewCode.replaceAll('-', '')));
-    assert.ok(!repoText.includes(token));
-
-    // Requester collects the keys once.
-    r = await call('POST', `/api/requests/${rid}/status`, { body: { token } });
-    assert.deepEqual([r.data.status, r.data.adminKey, r.data.reviewCode], ['approved', adminKey, reviewCode]);
-    r = await call('POST', `/api/requests/${rid}/status`, { body: { token } });
-    assert.equal(r.data.claimed, true);
-    assert.equal(r.data.adminKey, undefined, 'keys are only shown once');
 
     // Access levels
     const S = `/api/s/${spaceId}`;
@@ -93,8 +60,12 @@ test('request → approve → collect keys → review flow', async () => {
     assert.deepEqual([r.data.authorized, r.data.admin, r.data.reviewCode], [true, false, null], 'codes are case and dash insensitive');
     const imageToken = r.data.imageToken;
     assert.match(imageToken, /^[a-z0-9]+\.[A-Za-z0-9_-]{32}$/);
+    r = await call('GET', `${S}/me`, { as: nimal });
+    assert.deepEqual([r.data.authorized, r.data.admin, r.data.owner, r.data.role, r.data.reviewCode], [true, true, true, 'owner', reviewCode]);
+    r = await call('GET', `${S}/me`, { as: user('stranger') });
+    assert.deepEqual([r.data.authorized, r.data.admin], [false, false], 'an account alone gives no access');
     r = await call('GET', `${S}/me`, { key: adminKey });
-    assert.deepEqual([r.data.authorized, r.data.admin, r.data.reviewCode], [true, true, reviewCode]);
+    assert.equal(r.data.admin, true, 'legacy space keys still work while LEGACY_SPACE_KEYS is on');
     r = await call('GET', `${S}/me`, { key: adminKey.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A')) });
     assert.equal(r.data.admin, false);
     r = await call('GET', '/api/s/szzzzzzzzzzzzz/me');
@@ -102,17 +73,17 @@ test('request → approve → collect keys → review flow', async () => {
 
     r = await call('POST', `${S}/sections`, { code: reviewCode, body: { title: 'Rider onboarding' } });
     assert.equal(r.status, 403, 'reviewers cannot create sections');
-    r = await call('POST', `${S}/sections`, { key: adminKey, body: { title: 'Rider onboarding', description: 'Sign-up screens' } });
+    r = await call('POST', `${S}/sections`, { as: nimal, body: { title: 'Rider onboarding', description: 'Sign-up screens' } });
     assert.equal(r.status, 201);
     const sid = r.data.id;
 
-    r = await call('POST', `${S}/sections/${sid}/images`, { key: adminKey, body: pngBody('Login Screen.PNG', { caption: 'v2' }) });
+    r = await call('POST', `${S}/sections/${sid}/images`, { as: nimal, body: pngBody('Login Screen.PNG', { caption: 'v2' }) });
     assert.equal(r.status, 201);
     const img = r.data.images[0];
     assert.match(img.path, new RegExp(`^${sid}/[a-z0-9]+-login-screen\\.png$`));
     assert.equal(img.bytes, PNG.length);
     assert.ok(gh.files()[`spaces/${spaceId}/images/${img.path}`]);
-    r = await call('POST', `${S}/sections/${sid}/images`, { key: adminKey, body: { filename: 'x.exe', data: 'AAAA' } });
+    r = await call('POST', `${S}/sections/${sid}/images`, { as: nimal, body: { filename: 'x.exe', data: 'AAAA' } });
     assert.equal(r.status, 400);
 
     r = await call('GET', `${S}/project`, { code: reviewCode });
@@ -133,15 +104,17 @@ test('request → approve → collect keys → review flow', async () => {
     r = await call('GET', `/img/${spaceId}/%2E%2E%2Findex.json?t=${imageToken}`);
     assert.equal(r.status, 400);
 
-    // Comments: pinned on image, on section, reply, unicode
+    // Comments: pinned on image, on section, reply, unicode. Account comments use the account name.
     r = await call('POST', `${S}/sections/${sid}/comments`, { code: reviewCode, body: { author: 'Nimal', text: 'Button too small', target: img.id, pin: { x: 140, y: 33.333 } } });
     assert.equal(r.status, 201);
     const c1 = r.data.comments[0];
     assert.deepEqual(c1.pin, { x: 100, y: 33.33 });
     r = await call('POST', `${S}/sections/${sid}/comments`, { code: reviewCode, body: { author: 'කමල්', text: 'Flow looks good 👍', target: 'section' } });
     assert.equal(r.data.comments[1].text, 'Flow looks good 👍');
-    r = await call('POST', `${S}/sections/${sid}/comments`, { key: adminKey, body: { author: 'Erantha', text: 'Will fix', parentId: c1.id, target: 'section' } });
+    r = await call('POST', `${S}/sections/${sid}/comments`, { as: nimal, body: { author: 'Erantha', text: 'Will fix', parentId: c1.id, target: 'section' } });
     assert.equal(r.data.comments[2].target, img.id, 'reply inherits the parent target');
+    assert.deepEqual([r.data.comments[2].author, r.data.comments[2].verified], ['Nimal', true], 'signed-in authors can’t be impersonated');
+    assert.equal(r.data.comments[0].verified, undefined);
     r = await call('POST', `${S}/sections/${sid}/comments`, { code: reviewCode, body: { author: '', text: 'x' } });
     assert.equal(r.status, 400);
 
@@ -153,13 +126,13 @@ test('request → approve → collect keys → review flow', async () => {
 
     r = await call('PATCH', `${S}/sections/${sid}/comments/${c1.id}`, { code: reviewCode, body: { resolved: true } });
     assert.equal(r.status, 403);
-    r = await call('PATCH', `${S}/sections/${sid}/comments/${c1.id}`, { key: adminKey, body: { resolved: true } });
+    r = await call('PATCH', `${S}/sections/${sid}/comments/${c1.id}`, { as: nimal, body: { resolved: true } });
     assert.equal(r.data.comments.find((c) => c.id === c1.id).resolved, true);
-    r = await call('DELETE', `${S}/sections/${sid}/comments/${c1.id}`, { key: adminKey });
+    r = await call('DELETE', `${S}/sections/${sid}/comments/${c1.id}`, { as: nimal });
     assert.equal(r.data.comments.length, 9, 'comment and its reply removed');
 
     // Rotating the review code locks out the old one.
-    r = await call('POST', `${S}/rotate-code`, { key: adminKey });
+    r = await call('POST', `${S}/rotate-code`, { as: nimal });
     const newCode = r.data.reviewCode;
     assert.notEqual(newCode, reviewCode);
     r = await call('GET', `${S}/project`, { code: reviewCode });
@@ -170,20 +143,22 @@ test('request → approve → collect keys → review flow', async () => {
     assert.equal(r.status, 401, 'a new review code also cuts off old image links');
 
     // Deleting a screenshot frees its storage; deleting a section removes its files.
-    r = await call('DELETE', `${S}/sections/${sid}/images/${img.id}`, { key: adminKey });
+    r = await call('DELETE', `${S}/sections/${sid}/images/${img.id}`, { as: nimal });
     assert.equal(r.data.images.length, 0);
-    r = await call('POST', `${S}/sections/${sid}/images`, { key: adminKey, body: pngBody('again.png') });
-    r = await call('DELETE', `${S}/sections/${sid}`, { key: adminKey });
+    r = await call('POST', `${S}/sections/${sid}/images`, { as: nimal, body: pngBody('again.png') });
+    r = await call('DELETE', `${S}/sections/${sid}`, { as: nimal });
     assert.equal(r.status, 200);
-    r = await call('GET', `${S}/project`, { key: adminKey });
+    r = await call('GET', `${S}/project`, { as: nimal });
     assert.deepEqual([r.data.sections.length, r.data.space.usedBytes], [0, 0]);
     assert.deepEqual(Object.keys(gh.files()).filter((p) => p.startsWith(`spaces/${spaceId}/`)), [`spaces/${spaceId}/index.json`]);
 
     // Space owners can't delete an approved space; the site admin can.
-    r = await call('DELETE', S, { key: adminKey });
+    r = await call('DELETE', S, { as: nimal });
     assert.equal(r.status, 403);
     r = await call('POST', `/api/admin/spaces/${spaceId}/rotate-key`, { site: true });
     assert.notEqual(r.data.adminKey, adminKey);
+    r = await call('GET', `/api/admin/audit?space=${spaceId}`, { site: true });
+    assert.ok(['request.approve', 'space.view_keys', 'space.rotate_key'].every((a) => r.data.entries.some((e) => e.action === a)), 'admin actions are audited');
     r = await call('DELETE', `/api/admin/spaces/${spaceId}`, { site: true });
     assert.equal(r.status, 200);
     r = await call('GET', `${S}/me`, { site: true });
@@ -206,22 +181,24 @@ test('request → approve → collect keys → review flow', async () => {
 
 test('requests can be rejected and are rate limited', async () => {
   const { call, restore } = setup();
+  const a = user('a');
   try {
     const ids = [];
     for (let i = 0; i < 3; i++) {
-      const r = await call('POST', '/api/requests', { body: { name: 'A', email: 'a@b.co', purpose: 'p' } });
+      const r = await call('POST', '/api/requests', { as: a, ip: `3.3.3.${i}`, body: { purpose: 'p' } });
       assert.equal(r.status, 201);
       ids.push(r.data);
     }
-    let r = await call('POST', '/api/requests', { body: { name: 'A', email: 'a@b.co', purpose: 'p' } });
-    assert.equal(r.status, 429, 'max 3 pending per visitor');
-    r = await call('POST', '/api/requests', { ip: '2.2.2.2', body: { name: 'B', email: 'b@b.co', purpose: 'p' } });
+    let r = await call('POST', '/api/requests', { as: a, ip: '3.3.3.9', body: { purpose: 'p' } });
+    assert.equal(r.status, 429, 'max 3 pending per account');
+    r = await call('POST', '/api/requests', { as: user('b'), ip: '2.2.2.2', body: { purpose: 'p' } });
     assert.equal(r.status, 201);
 
     r = await call('POST', `/api/admin/requests/${ids[0].id}/reject`, { site: true, body: { reason: 'Not a fit' } });
     assert.equal(r.status, 200);
-    r = await call('POST', `/api/requests/${ids[0].id}/status`, { body: { token: ids[0].token } });
-    assert.deepEqual([r.data.status, r.data.reason], ['rejected', 'Not a fit']);
+    r = await call('GET', '/api/me', { as: a });
+    const mine = r.data.requests.find((x) => x.id === ids[0].id);
+    assert.deepEqual([mine.status, mine.reason], ['rejected', 'Not a fit']);
     r = await call('POST', `/api/admin/requests/${ids[0].id}/approve`, { site: true, body: {} });
     assert.equal(r.status, 409);
   } finally {
@@ -351,48 +328,6 @@ test('missing configuration is logged, not shown to clients', async () => {
 
 /* ------------------------------------------------------------- security */
 
-// RFC 6238 test helper: the current 6-digit code for a base32 secret.
-function totp(secretB32, t = Date.now()) {
-  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let bits = '';
-  for (const ch of secretB32) bits += alpha.indexOf(ch).toString(2).padStart(5, '0');
-  const key = Buffer.from(bits.match(/.{8}/g).map((b) => parseInt(b, 2)));
-  const msg = Buffer.alloc(8);
-  msg.writeBigUInt64BE(BigInt(Math.floor(t / 30_000)));
-  const h = createHmac('sha1', key).update(msg).digest();
-  const o = h[h.length - 1] & 0xf;
-  return String((h.readUInt32BE(o) & 0x7fffffff) % 1e6).padStart(6, '0');
-}
-
-test('site admin: key is exchanged for a 1-hour session, TOTP when configured', async () => {
-  const { call, restore } = setup({ ADMIN_TOTP_SECRET: 'JBSWY3DPEHPK3PXP' });
-  const realNow = Date.now;
-  try {
-    let r = await call('GET', '/api/admin/overview', { headers: { 'X-Admin-Key': 'admin-secret' } });
-    assert.equal(r.status, 403, 'the raw admin key is no longer accepted on API calls');
-    r = await call('POST', '/api/admin/session', { body: { key: 'admin-secret' } });
-    assert.equal(r.status, 403, 'TOTP is required when configured');
-    r = await call('POST', '/api/admin/session', { body: { key: 'wrong', otp: totp('JBSWY3DPEHPK3PXP') } });
-    assert.equal(r.status, 403);
-    r = await call('POST', '/api/admin/session', { body: { key: 'admin-secret', otp: totp('JBSWY3DPEHPK3PXP') } });
-    assert.equal(r.status, 201);
-    const { session } = r.data;
-    assert.match(session, /^as\./);
-    r = await call('GET', '/api/admin/overview', { session });
-    assert.equal(r.status, 200);
-    r = await call('GET', '/api/admin/overview', { session: session.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A')) });
-    assert.equal(r.status, 403, 'tampered session');
-    Date.now = () => realNow() + 61 * 60e3;
-    r = await call('GET', '/api/admin/overview', { session });
-    assert.equal(r.status, 403, 'sessions expire after an hour');
-    r = await call('GET', '/api/config');
-    assert.equal(r.data.adminOtp, true);
-  } finally {
-    Date.now = realNow;
-    restore();
-  }
-});
-
 test('wrong credentials are rate limited per IP, even when a later guess is right', async () => {
   const { call, restore } = setup({ RATE_AUTH_PER_MIN: '5' });
   try {
@@ -406,8 +341,6 @@ test('wrong credentials are rate limited per IP, even when a later guess is righ
     assert.equal(r.status, 200, 'other visitors are unaffected');
     for (let i = 0; i < 10; i++) r = await call('GET', `${S}/project`, { code: demo.reviewCode, ip: '6.6.6.6' });
     assert.equal(r.status, 200, 'a known-good code does not use up the limit');
-    for (let i = 0; i < 6; i++) r = await call('POST', '/api/admin/session', { body: { key: 'nope' }, ip: '5.5.5.5' });
-    assert.equal(r.status, 429, 'admin sign-in is limited too');
   } finally {
     restore();
   }

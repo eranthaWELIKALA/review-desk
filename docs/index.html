@@ -9,9 +9,11 @@
   <title>Review Desk</title>
   <meta name="robots" content="noindex">
   <meta name="referrer" content="no-referrer">
-  <!-- Keep the Worker URL here in sync with config.js. GitHub Pages can't send headers,
-       so frame-ancestors (clickjacking) needs a custom domain or proxy later. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://screenshot-review-api.review-desk.workers.dev; connect-src 'self' https://screenshot-review-api.review-desk.workers.dev; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <!-- Keep the Worker URL here in sync with config.js. *.clerk.accounts.dev is Clerk's
+       development instance; with a production instance, use clerk.<your domain> instead.
+       style-src needs 'unsafe-inline' for Clerk's components. GitHub Pages can't send
+       headers, so frame-ancestors (clickjacking) needs a custom domain or proxy later. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://challenges.cloudflare.com https://*.clerk.accounts.dev https://*.protect.clerk.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://screenshot-review-api.review-desk.workers.dev https://img.clerk.com; connect-src 'self' https://screenshot-review-api.review-desk.workers.dev https://*.clerk.accounts.dev https://*.protect.clerk.com; frame-src https://challenges.cloudflare.com https://*.protect.clerk.com; worker-src 'self' blob:; base-uri 'none'; form-action 'self' https://*.clerk.accounts.dev; object-src 'none'">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e8590c'/%3E%3Cpath d='M9 11h14v10H9z' fill='none' stroke='white' stroke-width='2.4' stroke-linejoin='round'/%3E%3Ccircle cx='21' cy='21' r='4' fill='white'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>

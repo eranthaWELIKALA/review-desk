@@ -1,10 +1,14 @@
 /* Review Desk — static front end for GitHub Pages.
  * All reads/writes go through the Worker in config.js; nothing secret lives here.
  *
+ * Sign-in is Clerk (config.js: clerkPublishableKey). Each API call carries a fresh,
+ * short-lived Clerk session token; the Worker decides what that account may do.
+ *
  * Routes (hash):
- *   #/                     home: try a demo, request a space, open one
+ *   #/                     home: your spaces, try a demo, request a space
  *   #/admin                site admin console
- *   #/r/<id>[/<token>]     status of a space request
+ *   #/invite[/<token>]     accept an invite to own or edit a space
+ *   #/r/<id>[/<token>]     status of a space request made before accounts
  *   #/<space>[/s/<sid>[/i/<iid>]]   a space, a section, a screenshot */
 (() => {
   'use strict';
@@ -23,16 +27,15 @@
     setJson(k, v) { this.set(k, v == null ? null : JSON.stringify(v)); },
   };
 
-  // The site admin session (never the admin key itself) lives only in this tab's
-  // sessionStorage, so it is gone when the tab closes and expires within an hour.
+  // Tab-only storage: an invite token waiting for sign-in to finish.
   const session = {
     get(k) { try { return sessionStorage.getItem('rd:' + k); } catch { return null; } },
     set(k, v) { try { v == null ? sessionStorage.removeItem('rd:' + k) : sessionStorage.setItem('rd:' + k, v); } catch { /* private mode */ } },
   };
-  store.set('siteKey', null);   // purge the raw key older versions kept in localStorage
-  session.set('siteKey', null); // …and in sessionStorage
-  // Admin sessions look like as.<expiry, base 36>.<mac>.
-  const sessionExpiry = (t) => parseInt(String(t || '').split('.')[1] || '0', 36) || 0;
+  // Purge admin credentials that older versions kept; admins sign in with an account now.
+  store.set('siteKey', null);
+  session.set('siteKey', null);
+  session.set('siteSession', null);
 
   // Keys and review codes per space, remembered on this device only.
   const creds = {
@@ -55,7 +58,11 @@
     config: null,
     me: null,
     project: null,
-    siteSession: session.get('siteSession') || '',
+    account: null,       // GET /api/me: { signedIn, user, spaces, requests, siteAdmin, … }
+    invite: null,        // invite preview on #/invite
+    shareTab: 'reviewers',
+    members: null,       // GET /api/s/<id>/members, for the Team tab
+    audit: null,         // admin Activity tab
     overview: null,
     usage: {},           // space id -> admin info (usage), loaded lazily
     adminTab: 'requests',
@@ -95,6 +102,9 @@
     key: svg('<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M15 8l2 2"/>'),
     clock: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
     check: svg('<path d="M5 12l5 5L20 7"/>', 2.4),
+    user: svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'),
+    mail: svg('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>'),
+    shield: svg('<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/>'),
     x: svg('<path d="M6 6l12 12M18 6L6 18"/>', 2.4),
   };
 
@@ -155,11 +165,71 @@
     try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { prompt('Copy this:', text); }
   }
 
+  /* ------------------------------------------------------------------- auth */
+  // Clerk is loaded from its own Frontend API host, which the publishable key encodes
+  // (pk_test_<base64 of "host$">). 'dev' loads the local stand-in from dev/server.mjs.
+  const CLERK_KEY = String((window.REVIEW_CONFIG || {}).clerkPublishableKey || '');
+  let clerk = null;
+  const loadScript = (src, attrs = {}) => new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = src;
+    el.async = true;
+    el.crossOrigin = 'anonymous';
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    el.onload = resolve;
+    el.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.head.append(el);
+  });
+  const clerkReady = (async () => {
+    if (!CLERK_KEY) return null;
+    try {
+      if (CLERK_KEY === 'dev') {
+        await loadScript('/dev-clerk.js');
+        await window.Clerk.load();
+      } else {
+        const host = atob(CLERK_KEY.split('_')[2] || '').replace(/\$$/, '');
+        if (!/^[a-z0-9.-]+$/i.test(host)) throw new Error('clerkPublishableKey in config.js is not valid');
+        await loadScript(`https://${host}/npm/@clerk/ui@1/dist/ui.browser.js`);
+        await loadScript(`https://${host}/npm/@clerk/clerk-js@6/dist/clerk.browser.js`, { 'data-clerk-publishable-key': CLERK_KEY });
+        await window.Clerk.load({ ui: { ClerkUI: window.__internal_ClerkUICtor } });
+      }
+      clerk = window.Clerk;
+      // Signing in or out anywhere (this tab, another tab, a profile change) refreshes the account.
+      let last = clerk.user?.id || null;
+      clerk.addListener(({ user }) => {
+        const now = user?.id || null;
+        if (now !== last) { last = now; refreshAccount().then(() => route()); }
+      });
+      return clerk;
+    } catch (err) {
+      console.error(err);
+      toast('Sign-in is unavailable right now. You can still review with a link.', 'error');
+      return null;
+    }
+  })();
+  const signedIn = () => !!clerk?.user;
+
+  async function authHeader(fresh = false) {
+    await clerkReady;
+    if (!clerk?.session) return {};
+    const t = await clerk.session.getToken(fresh ? { skipCache: true } : undefined).catch(() => null);
+    return t ? { Authorization: `Bearer ${t}` } : {};
+  }
+
+  function signIn() {
+    if (!clerk) return toast(CLERK_KEY ? 'Sign-in is still loading, try again in a moment.' : 'Sign-in isn’t set up on this site yet.', 'error');
+    clerk.openSignIn({ forceRedirectUrl: location.href, signUpForceRedirectUrl: location.href });
+  }
+
+  async function refreshAccount() {
+    state.account = signedIn() ? await api('GET', '/api/me', undefined, { space: null }).catch(() => null) : { signedIn: false };
+    return state.account;
+  }
+
   /* -------------------------------------------------------------------- api */
-  async function api(method, path, body, { space = spaceId(), headers: extra = {} } = {}) {
-    const headers = { ...extra };
+  async function api(method, path, body, { space = spaceId(), headers: extra = {} } = {}, retried = false) {
+    const headers = { ...extra, ...(await authHeader(retried)) };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    if (state.siteSession) headers['X-Admin-Session'] = state.siteSession;
     if (space) {
       const c = creds.get(space);
       if (c.key) headers['X-Space-Key'] = c.key;
@@ -172,6 +242,8 @@
       throw new Error('Could not reach the review server. Check your connection and try again.');
     }
     const data = await res.json().catch(() => ({}));
+    // A session token can expire in flight: get a fresh one and try once more.
+    if (res.status === 401 && headers.Authorization && !retried) return api(method, path, body, { space, headers: extra }, true);
     if (!res.ok) {
       const err = new Error(data.error || `Request failed (${res.status})`);
       err.status = res.status;
@@ -241,6 +313,7 @@
   function parseRoute() {
     const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     if (parts[0] === 'admin') return { view: 'admin' };
+    if (parts[0] === 'invite') return { view: 'invite', token: parts[1] || null };
     if (parts[0] === 'r' && parts[1]) return { view: 'request', rid: parts[1], token: parts[2] || null };
     if (SPACE_RE.test(parts[0] || '')) {
       return { view: 'space', space: parts[0], sid: parts[1] === 's' ? parts[2] || null : null, iid: parts[3] === 'i' ? parts[4] || null : null };
@@ -267,9 +340,13 @@
     state.me = null;
     document.body.style.overflow = '';
     if (r.view === 'admin') return openAdmin();
+    if (r.view === 'invite') return openInvite(r.token);
     if (r.view === 'request') return openRequest(r.rid, r.token);
     document.title = 'Review Desk';
-    return render();
+    render();
+    // Home lists the account's spaces and requests.
+    await clerkReady;
+    if (signedIn() && state.route.view === 'home') { await refreshAccount(); if (state.route.view === 'home') render(); }
   }
 
   function render() {
@@ -277,14 +354,31 @@
     if (v === 'space') return renderSpace();
     if (v === 'admin') return renderAdmin();
     if (v === 'request') return renderRequest();
+    if (v === 'invite') return renderInvite();
     return renderHome();
   }
 
   /* ------------------------------------------------------------- page bits */
   const brand = (label = 'Review Desk') => `<a class="brand" href="#/" title="Review Desk home"><div class="brand-mark">${I.logo}</div><span>${esc(label)}</span></a>`;
 
+  // Sign-in button, or the signed-in account (opens Clerk's account page).
+  function accountButton() {
+    if (!CLERK_KEY) return '';
+    if (!signedIn()) return `<button class="btn ghost sm" data-action="sign-in">${I.user}<span class="hide-xs">Sign in</span></button>`;
+    const u = clerk.user;
+    const name = u.fullName || u.primaryEmailAddress?.emailAddress || 'Account';
+    return `<div class="menu-wrap"><button class="btn ghost sm account-btn" data-action="account-menu" aria-haspopup="menu" aria-expanded="${state.menuOpen === 'account'}" title="${esc(name)}">${avatar(name)}<span class="hide-sm">${esc(name)}</span></button>
+      ${state.menuOpen === 'account' ? `<div class="menu" role="menu">
+        <div class="menu-head">${esc(u.primaryEmailAddress?.emailAddress || '')}</div>
+        <button role="menuitem" data-action="manage-account">Manage account and security</button>
+        <a role="menuitem" href="#/">Your spaces</a>
+        ${state.account?.siteAdmin ? '<a role="menuitem" href="#/admin">Site admin</a>' : ''}
+        <button role="menuitem" data-action="sign-out">Sign out</button>
+      </div>` : ''}</div>`;
+  }
+
   function page(inner) {
-    $('#app').innerHTML = `<header class="topbar">${brand()}<div class="spacer"></div></header><main class="page">${inner}</main>`;
+    $('#app').innerHTML = `<header class="topbar">${brand()}<div class="spacer"></div>${accountButton()}</header><main class="page">${inner}</main>`;
   }
   function loading() { $('#app').innerHTML = '<div class="boot">Loading…</div>'; }
 
@@ -312,14 +406,20 @@
     const quota = cfg ? fmtBytes(cfg.demo.quotaBytes) : '5 MB';
     const hours = cfg ? cfg.demo.hours : 24;
 
+    const acct = state.account?.signedIn ? state.account : null;
+    const mine = acct?.spaces || [];
+    const mineIds = new Set(mine.map((x) => x.id));
+    // Demos and review links live on this device; account spaces come from the server.
     const spaces = Object.entries(creds.all())
-      .filter(([id, c]) => (c.key || c.code) && !(c.kind === 'demo' && c.expiresAt && Date.parse(c.expiresAt) < Date.now()) && SPACE_RE.test(id))
+      .filter(([id, c]) => (c.key || c.code) && !mineIds.has(id) && !(c.kind === 'demo' && c.expiresAt && Date.parse(c.expiresAt) < Date.now()) && SPACE_RE.test(id))
       .sort((a, b) => (b[1].seen || 0) - (a[1].seen || 0));
     const reqs = myRequests();
+    const roleLabel = (r) => ({ owner: 'Owner', editor: 'Editor' }[r] || r);
 
     $('#app').innerHTML = `
       <header class="topbar">${brand()}<div class="spacer"></div>
-        <button class="btn ghost sm" data-action="request-space">Request a space</button>
+        <button class="btn ghost sm hide-xs" data-action="request-space">Request a space</button>
+        ${accountButton()}
       </header>
       <main class="page home">
         <section class="hero">
@@ -340,23 +440,49 @@
           <article class="option">
             <div class="option-icon">${I.box}</div>
             <h2>Get your own space</h2>
-            <p>For real projects: ${cfg ? fmtBytes(cfg.spaceQuotaBytes) : 'more'} of storage and nothing expires. Tell us what it’s for and an admin will set it up.</p>
-            <div class="option-foot"><button class="btn" data-action="request-space">Request a space</button></div>
+            <p>For real projects: ${cfg ? fmtBytes(cfg.spaceQuotaBytes) : 'more'} of storage, nothing expires, and you can invite your team. Tell us what it’s for and an admin will set it up.</p>
+            <div class="option-foot"><button class="btn" data-action="request-space">${signedIn() || !CLERK_KEY ? 'Request a space' : 'Sign in to request a space'}</button></div>
           </article>
           <article class="option">
             <div class="option-icon">${I.key}</div>
-            <h2>Have a key or link?</h2>
-            <p>Paste your space key, or a review link someone sent you.</p>
+            <h2>Have a link?</h2>
+            <p>Paste a review link someone sent you, or a space key from before accounts.</p>
             <form class="option-foot open-form" data-form="open">
               <label class="sr-only" for="open-value">Space key or review link</label>
-              <input class="input" id="open-value" name="value" placeholder="sk-… or https://…" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+              <input class="input" id="open-value" name="value" placeholder="https://… or sk-…" autocomplete="off" autocapitalize="off" spellcheck="false" required>
               <button class="btn" type="submit">Open</button>
             </form>
           </article>
         </div>
 
+        ${acct?.adminNeedsMfa ? `<div class="notice-box warn">${I.shield}<span>Your account is a site admin, but the admin console needs two-step verification. <button class="link-btn" data-action="manage-account">Turn it on in your account</button>, then sign in again.</span></div>` : ''}
+
+        ${mine.length ? `<section class="list-block">
+          <h3>Your spaces</h3>
+          <div class="rows">${mine.map((x) => `
+            <div class="row-item">
+              <a class="ri-main" href="#/${esc(x.id)}">
+                <span class="ri-title">${esc(x.title)}</span>
+                <span class="ri-sub"><span class="pill">Space</span> · ${esc(roleLabel(x.role))}</span>
+              </a>
+            </div>`).join('')}
+          </div>
+        </section>` : ''}
+
+        ${acct?.requests?.length ? `<section class="list-block">
+          <h3>Your space requests</h3>
+          <div class="rows">${acct.requests.map((r) => `
+            <div class="row-item">
+              ${r.status === 'approved' && r.spaceId ? `<a class="ri-main" href="#/${esc(r.spaceId)}">` : '<div class="ri-main">'}
+                <span class="ri-title">${esc(r.organization || 'Space request')} · ${esc(ago(r.createdAt))}</span>
+                <span class="ri-sub"><span class="pill status-${esc(r.status)}">${esc(statusLabel(r.status))}</span>${r.reason ? ` · ${esc(r.reason)}` : ''}</span>
+              ${r.status === 'approved' && r.spaceId ? '</a>' : '</div>'}
+            </div>`).join('')}
+          </div>
+        </section>` : ''}
+
         ${spaces.length ? `<section class="list-block">
-          <h3>On this device</h3>
+          <h3>${mine.length ? 'Also on this device' : 'On this device'}</h3>
           <div class="rows">${spaces.map(([id, c]) => `
             <div class="row-item">
               <a class="ri-main" href="#/${id}">
@@ -369,7 +495,7 @@
         </section>` : ''}
 
         ${reqs.length ? `<section class="list-block">
-          <h3>Your space requests</h3>
+          <h3>Earlier requests on this device</h3>
           <div class="rows">${reqs.map((r) => `
             <div class="row-item">
               <a class="ri-main" href="#/r/${esc(r.id)}">
@@ -471,6 +597,48 @@
     });
   }
 
+  /* ---------------------------------------------------------------- invites */
+  // The token comes in the link's fragment. It's moved to this tab's storage and
+  // taken out of the address bar, so it survives a social-login round trip but
+  // doesn't stay in history.
+  async function openInvite(tokenFromUrl) {
+    if (tokenFromUrl) {
+      session.set('invite', tokenFromUrl);
+      history.replaceState(null, '', `${location.pathname}${location.search}#/invite`);
+    }
+    const token = session.get('invite');
+    document.title = 'Invite · Review Desk';
+    if (!token) return notice({ title: 'Invite link missing', text: 'Open the link from your invite email again.', actions: homeBtn });
+    loading();
+    try {
+      state.invite = await api('GET', `/api/invites/${encodeURIComponent(token)}`, undefined, { space: null });
+    } catch (e) {
+      session.set('invite', null);
+      return notice({ icon: I.x, tone: 'danger', title: 'This invite can’t be used', text: esc(e.message), actions: homeBtn });
+    }
+    await clerkReady;
+    render();
+  }
+
+  function renderInvite() {
+    const inv = state.invite;
+    if (!inv) return loading();
+    const role = inv.role === 'owner' ? 'an owner' : 'an editor';
+    if (inv.status !== 'pending') {
+      session.set('invite', null);
+      const why = { accepted: 'has already been used', revoked: 'was cancelled', expired: 'has expired' }[inv.status];
+      return notice({ icon: I.x, tone: 'danger', title: `This invite ${why}`, text: `Ask ${esc(inv.inviter)} to send a new one.`, actions: homeBtn });
+    }
+    const who = signedIn() ? clerk.user.primaryEmailAddress?.emailAddress : '';
+    notice({
+      icon: I.mail, title: `Join “${esc(inv.title)}”`,
+      text: `${esc(inv.inviter)} invited you to be ${role} of this space. The invite is for <b>${esc(inv.email)}</b> and expires ${esc(ago(inv.expiresAt))}.${who ? `</p><p class="muted">Signed in as ${esc(who)}.` : ''}`,
+      actions: signedIn()
+        ? `<button class="btn primary" data-action="accept-invite">${I.check}Accept invite</button><button class="btn" data-action="sign-out">Use another account</button>`
+        : `<button class="btn primary" data-action="sign-in">${I.user}Sign in to accept</button>${homeBtn}`,
+    });
+  }
+
   /* ---------------------------------------------------------------- spaces */
   async function openSpace(id) {
     state.project = null;
@@ -499,6 +667,8 @@
       return spaceGate(id, c.code ? 'That review code no longer works. Ask for a new link.' : '', me.space);
     }
     state.me = me;
+    state.members = null;
+    state.shareTab = 'reviewers';
     if (c.key || c.code) creds.set(id, { title: me.space.title, kind: me.space.kind, expiresAt: me.space.expiresAt, ...(c.key ? { code: me.reviewCode } : {}) });
     await load();
     if (state.welcome === id) { state.welcome = null; welcomeDemo(); }
@@ -522,15 +692,16 @@
     const demo = info?.kind === 'demo';
     page(`
       <form class="card-form" id="gate-form" novalidate>
-        <h1>${asOwner ? 'Owner sign-in' : 'Enter the review code'}</h1>
-        <p>${asOwner ? 'Paste the space key you received when the space was created.' : 'You should have received it with the link to this page.'}${demo && info.expiresAt ? ` This demo space ends in ${timeLeft(info.expiresAt)}.` : ''}</p>
+        <h1>${asOwner ? 'Use a space key' : 'Enter the review code'}</h1>
+        <p>${asOwner ? 'Paste the space key you received when the space was created (spaces made before accounts).' : 'You should have received it with the link to this page.'}${demo && info.expiresAt ? ` This demo space ends in ${timeLeft(info.expiresAt)}.` : ''}</p>
+        ${!asOwner && CLERK_KEY && !signedIn() ? `<p class="muted">Owner or editor? <button type="button" class="link-btn" data-action="sign-in">Sign in</button> instead.</p>` : ''}
         <div class="field">
           <label for="gate-value">${asOwner ? 'Space key' : 'Review code'}</label>
           <input class="input ${asOwner ? 'mono' : 'code-input'}" id="gate-value" ${asOwner ? 'type="password" placeholder="sk-…"' : 'placeholder="ABCD-EFGH-JKMN" autocapitalize="characters"'} autocomplete="off" spellcheck="false" required>
         </div>
         ${message ? `<div class="err">${esc(message)}</div>` : ''}
         <div class="row">
-          <button type="button" class="link-btn" id="gate-switch">${asOwner ? 'I have a review code' : 'I own this space'}</button>
+          <button type="button" class="link-btn" id="gate-switch">${asOwner ? 'I have a review code' : 'I have a space key'}</button>
           <button class="btn primary" type="submit">Continue</button>
         </div>
       </form>`);
@@ -607,25 +778,29 @@
         </div>
         <div class="spacer"></div>
         <button class="btn ghost sm" data-action="refresh" title="Load latest comments" aria-label="Refresh">${I.refresh}<span class="hide-sm">Refresh</span></button>
-        ${admin ? `<button class="btn primary sm" data-action="share" title="Invite reviewers">${I.share}<span class="hide-xs">Share</span></button>` : ''}
+        ${admin ? `<button class="btn primary sm" data-action="share" title="Invite reviewers and your team" aria-label="Share">${I.share}<span class="hide-xs">Share</span></button>` : ''}
         <div class="menu-wrap">
-          <button class="btn ghost sm icon" data-action="menu" aria-haspopup="menu" aria-expanded="${state.menuOpen}" title="More" aria-label="More options">${I.dots}</button>
-          ${state.menuOpen ? spaceMenu() : ''}
+          <button class="btn ghost sm icon" data-action="menu" aria-haspopup="menu" aria-expanded="${state.menuOpen === 'space'}" title="More" aria-label="More options">${I.dots}</button>
+          ${state.menuOpen === 'space' ? spaceMenu() : ''}
         </div>
+        ${accountButton()}
       </header>`;
   }
+
+  const roleName = () => ({ 'site-admin': 'Site admin', owner: 'Owner', editor: 'Editor' }[state.me?.role] || 'Reviewer');
 
   function spaceMenu() {
     const admin = isAdmin();
     const c = creds.get(spaceId());
     const demo = state.project.space.kind === 'demo';
-    const role = state.me.siteAdmin && !c.key ? 'Site admin' : admin ? 'Owner' : 'Reviewer';
+    const member = ['owner', 'editor'].includes(state.me.role) && !c.key;
     return `<div class="menu" role="menu">
-      <div class="menu-head">${esc(role)}${state.name ? ` · ${esc(state.name)}` : ''}</div>
-      <button role="menuitem" data-action="change-name">${state.name ? 'Change your name' : 'Set your name'}</button>
+      <div class="menu-head">${esc(roleName())}${!signedIn() && state.name ? ` · ${esc(state.name)}` : ''}</div>
+      ${signedIn() ? '' : `<button role="menuitem" data-action="change-name">${state.name ? 'Change your name' : 'Set your name'}</button>`}
       ${admin ? '<button role="menuitem" data-action="rotate-code">New review code…</button>' : ''}
-      ${!admin ? '<button role="menuitem" data-action="owner-in">Owner sign-in…</button>' : ''}
-      ${admin && c.key ? '<button role="menuitem" data-action="owner-out">Sign out as owner</button>' : ''}
+      ${!admin ? '<button role="menuitem" data-action="owner-in">Use a space key…</button>' : ''}
+      ${admin && c.key ? '<button role="menuitem" data-action="owner-out">Stop using the space key</button>' : ''}
+      ${member && state.me.role !== 'site-admin' ? '<button role="menuitem" data-action="leave-space">Leave this space…</button>' : ''}
       <button role="menuitem" data-action="forget-space" data-id="${spaceId()}">Forget on this device</button>
       ${demo && admin ? '<button role="menuitem" class="danger" data-action="delete-demo">Delete this demo now…</button>' : ''}
       <a role="menuitem" href="#/">All spaces</a>
@@ -642,8 +817,14 @@
         <button class="link-btn" data-action="request-space">Get a permanent space</button>
       </div>`;
     }
-    if (!isAdmin()) return '';
-    return `<div class="strip"><span class="strip-usage">Storage ${meter(used, s.quotaBytes)}${fmtBytes(used)} of ${fmtBytes(s.quotaBytes)}</span></div>`;
+    // Space key holders of older spaces are asked to move to an account.
+    const claim = state.me.canClaim
+      ? `<span class="strip-claim">${I.shield}You’re using a space key. <button class="link-btn" data-action="claim-space">Make your account the owner</button></span>`
+      : creds.get(spaceId()).key && !signedIn() && CLERK_KEY
+        ? `<span class="strip-claim">${I.shield}You’re using a space key. <button class="link-btn" data-action="sign-in">Sign in</button> to move this space to your account.</span>`
+        : '';
+    if (!isAdmin()) return claim ? `<div class="strip">${claim}</div>` : '';
+    return `<div class="strip">${claim}<span class="strip-usage">Storage ${meter(used, s.quotaBytes)}${fmtBytes(used)} of ${fmtBytes(s.quotaBytes)}</span></div>`;
   }
 
   function sidebar(current) {
@@ -735,7 +916,7 @@
       <div>
         <div class="c-head">
           ${pinNo ? `<span class="pin-tag" title="Pinned on the screenshot">${pinNo}</span>` : ''}
-          <span class="who">${esc(c.author)}</span>
+          <span class="who">${esc(c.author)}</span>${c.verified ? `<span class="verified" title="Signed in">${I.check}</span>` : ''}
           <span class="when" title="${esc(new Date(c.createdAt).toLocaleString())}">${ago(c.createdAt)}</span>
           ${c.resolved ? '<span class="tag-resolved">✓ Resolved</span>' : ''}
         </div>
@@ -758,9 +939,11 @@
       <label class="sr-only" for="ta-${esc(key)}">${placeholder}</label>
       <textarea class="textarea" id="ta-${esc(key)}" data-draft="${esc(key)}" rows="${parentId ? 2 : 3}" maxlength="2000" placeholder="${placeholder}" required>${esc(state.drafts[key] || '')}</textarea>
       <div class="row">
-        ${state.name
-          ? `<span class="as">Commenting as <b>${esc(state.name)}</b></span>`
-          : '<input class="input name-input" name="author" placeholder="Your name" maxlength="60" required autocomplete="name"><span class="as"></span>'}
+        ${signedIn()
+          ? `<span class="as">Commenting as <b>${esc(clerk.user.fullName || clerk.user.primaryEmailAddress?.emailAddress || '')}</b></span>`
+          : state.name
+            ? `<span class="as">Commenting as <b>${esc(state.name)}</b></span>`
+            : '<input class="input name-input" name="author" placeholder="Your name" maxlength="60" required autocomplete="name"><span class="as"></span>'}
         ${parentId ? '<button type="button" class="btn ghost sm" data-action="cancel-reply">Cancel</button>' : ''}
         <button class="btn primary sm" type="submit">${parentId ? 'Reply' : 'Post'}</button>
       </div>
@@ -823,59 +1006,36 @@
   /* ------------------------------------------------------------- site admin */
   async function openAdmin() {
     document.title = 'Site admin · Review Desk';
-    if (!state.siteSession || sessionExpiry(state.siteSession) <= Date.now()) {
-      const expired = !!state.siteSession;
-      adminSignOut();
-      return adminGate(expired ? 'Your admin session ended. Please sign in again.' : '');
-    }
     loading();
+    await clerkReady;
+    if (!signedIn()) {
+      return notice({ icon: I.shield, title: 'Site admin', text: 'Sign in with a site admin account to approve requests and manage spaces.', actions: `<button class="btn primary" data-action="sign-in">${I.user}Sign in</button>${homeBtn}` });
+    }
+    await refreshAccount();
+    if (!state.account?.siteAdmin) {
+      return notice(state.account?.adminNeedsMfa
+        ? { icon: I.shield, title: 'Turn on two-step verification', text: 'The admin console needs two-step verification on your account. Turn it on, then sign out and in again.', actions: `<button class="btn primary" data-action="manage-account">Open account security</button><button class="btn" data-action="sign-out">Sign out</button>` }
+        : { icon: I.shield, tone: 'danger', title: 'Not a site admin', text: `${esc(clerk.user.primaryEmailAddress?.emailAddress || 'This account')} isn’t a site admin.`, actions: `<button class="btn" data-action="sign-out">Use another account</button>${homeBtn}` });
+    }
     try {
       state.overview = await api('GET', '/api/admin/overview', undefined, { space: null });
     } catch (e) {
-      if (e.status === 403) { adminSignOut(); return adminGate('Your admin session ended. Please sign in again.'); }
       return notice({ title: 'Can’t load the admin console', text: esc(e.message), actions: '<button class="btn" data-action="reload">Try again</button>' });
     }
     state.usage = {};
     render();
     loadUsage();
+    if (state.adminTab === 'activity') loadAudit();
   }
 
-  function adminSignOut() {
-    state.siteSession = '';
-    session.set('siteSession', null);
-  }
-
-  // The admin key is sent once and exchanged for a one-hour session; only the session is kept.
-  async function adminGate(message = '') {
-    if (!state.config) state.config = await api('GET', '/api/config', undefined, { space: null }).catch(() => null);
-    const otp = !!state.config?.adminOtp;
-    page(`
-      <form class="card-form" id="admin-form" novalidate>
-        <h1>Site admin</h1>
-        <p>Approve space requests and manage every space. Enter the <code>ADMIN_KEY</code> set on the Worker${otp ? ' and the code from your authenticator app' : ''}. You stay signed in for an hour, in this tab only.</p>
-        <div class="field"><label for="admin-key">Admin key</label><input class="input mono" id="admin-key" type="password" autocomplete="current-password" required></div>
-        ${otp ? '<div class="field"><label for="admin-otp">Authenticator code</label><input class="input mono" id="admin-otp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div>' : ''}
-        <div class="err" id="admin-err" ${message ? '' : 'hidden'}>${esc(message)}</div>
-        <div class="row"><a class="btn ghost" href="#/">Cancel</a><button class="btn primary" type="submit">Sign in</button></div>
-      </form>`);
-    $('#admin-key').focus();
-    $('#admin-form').onsubmit = async (e) => {
-      e.preventDefault();
-      const key = $('#admin-key').value.trim();
-      if (!key) return;
-      const btn = e.target.querySelector('[type=submit]');
-      btn.disabled = true;
-      try {
-        const r = await api('POST', '/api/admin/session', { key, otp: $('#admin-otp')?.value.trim() || undefined }, { space: null });
-        state.siteSession = r.session;
-        session.set('siteSession', r.session);
-        openAdmin();
-      } catch (err) {
-        $('#admin-err').hidden = false;
-        $('#admin-err').textContent = err.message;
-        btn.disabled = false;
-      }
-    };
+  async function loadAudit() {
+    state.audit = null;
+    try {
+      state.audit = await api('GET', '/api/admin/audit', undefined, { space: null });
+    } catch (e) {
+      state.audit = { error: e.message };
+    }
+    if (state.route.view === 'admin' && state.adminTab === 'activity') render();
   }
 
   // Usage needs one read per space, so it loads per space after the list renders.
@@ -897,14 +1057,14 @@
     if (!o) return loading();
     const pending = o.requests.filter((r) => r.status === 'pending').length;
     const tab = state.adminTab;
-    const tabs = [['requests', 'Requests', pending], ['spaces', 'Spaces', o.spaces.length], ['demos', 'Demos', o.demos.length]];
-    const body = tab === 'spaces' ? adminSpaces(o) : tab === 'demos' ? adminDemos(o) : adminRequests(o);
+    const tabs = [['requests', 'Requests', pending], ['spaces', 'Spaces', o.spaces.length], ['demos', 'Demos', o.demos.length], ['activity', 'Activity', 0]];
+    const body = tab === 'spaces' ? adminSpaces(o) : tab === 'demos' ? adminDemos(o) : tab === 'activity' ? adminActivity() : adminRequests(o);
 
     $('#app').innerHTML = `
       <header class="topbar">${brand()}<span class="chip admin hide-xs">Site admin</span><div class="spacer"></div>
         <button class="btn ghost sm" data-action="admin-refresh" aria-label="Refresh">${I.refresh}<span class="hide-sm">Refresh</span></button>
         <button class="btn primary sm" data-action="admin-new-space">${I.plus}<span class="hide-xs">New space</span></button>
-        <button class="btn ghost sm" data-action="admin-out">Sign out</button>
+        ${accountButton()}
       </header>
       <main class="page admin">
         <div class="tabs" role="tablist">
@@ -930,7 +1090,7 @@
           <div class="rc-sub"><a href="mailto:${esc(r.email)}">${esc(r.email)}</a>${r.organization ? ` · ${esc(r.organization)}` : ''} · ${esc(ago(r.createdAt))}</div>
           <p class="rc-text">${esc(r.purpose)}</p>
           ${r.reason ? `<p class="rc-note">Reason given: ${esc(r.reason)}</p>` : ''}
-          ${r.status === 'approved' ? `<p class="rc-note"><a href="#/${esc(r.spaceId)}">Open space</a> · ${r.claimedAt ? 'requester collected the key' : 'key not collected yet'}</p>` : ''}
+          ${r.status === 'approved' ? `<p class="rc-note"><a href="#/${esc(r.spaceId)}">Open space</a> · ${r.userId ? 'owned by the requester’s account' : r.claimedAt ? 'requester collected the key' : 'key not collected yet'}</p>` : ''}
         </div>
         <div class="rc-actions">
           ${r.status === 'pending'
@@ -951,7 +1111,7 @@
         </div>
         <div class="rc-actions">
           <a class="btn sm" href="#/${esc(s.id)}">Open</a>
-          <button class="btn sm" data-action="space-keys" data-id="${esc(s.id)}">${I.key}Keys</button>
+          <button class="btn sm" data-action="space-keys" data-id="${esc(s.id)}" title="Space key and review link (the key is only needed for spaces made before accounts)">${I.key}Keys</button>
           <button class="btn sm" data-action="space-quota" data-id="${esc(s.id)}">Storage</button>
           <button class="btn sm" data-action="space-rotate" data-id="${esc(s.id)}">New key</button>
           <button class="btn ghost sm danger" data-action="space-delete" data-id="${esc(s.id)}">${I.trash}Delete</button>
@@ -974,6 +1134,43 @@
           <button class="btn ghost sm danger" data-action="space-delete" data-id="${esc(d.id)}">${I.trash}Delete</button>
         </div>
       </article>`).join('')}</div>`;
+  }
+
+  const ACTION_LABELS = {
+    'request.create': 'requested a space', 'request.approve': 'approved a request', 'request.reject': 'rejected a request',
+    'space.create': 'created a space', 'space.delete': 'deleted a space', 'space.claim': 'claimed a space with its key',
+    'space.view_keys': 'viewed space keys', 'space.rotate_key': 'issued a new space key',
+    'invite.create': 'sent an invite', 'invite.reviewer': 'emailed a review link', 'invite.accept': 'accepted an invite',
+    'invite.revoke': 'cancelled an invite', 'invite.wrong_account': 'tried an invite meant for another address',
+    'member.role': 'changed a member’s role', 'member.remove': 'removed a member', 'member.leave': 'left a space',
+  };
+  function adminActivity() {
+    const a = state.audit;
+    if (!a) return '<div class="empty"><p>Loading activity…</p></div>';
+    if (a.error) return `<div class="empty"><p>${esc(a.error)}</p></div>`;
+    if (!a.entries.length) return '<div class="empty"><h3>No activity yet</h3></div>';
+    return `<p class="muted">The last 200 security-relevant actions. Entries are kept for a year.</p>
+      <div class="rows">${a.entries.map((e) => `
+        <div class="row-item"><div class="ri-main">
+          <span class="ri-title">${esc(e.actor === 'anon' ? 'Someone (no account)' : e.actor)} ${esc(ACTION_LABELS[e.action] || e.action)}</span>
+          <span class="ri-sub">${esc(ago(e.at))}${e.spaceId ? ` · <a href="#/${esc(e.spaceId)}">${esc(e.spaceId)}</a>` : ''}${e.detail?.role ? ` · ${esc(e.detail.role)}` : ''}${e.detail && 'emailed' in e.detail ? ` · ${e.detail.emailed ? 'emailed' : 'link only'}` : ''}</span>
+        </div></div>`).join('')}</div>`;
+  }
+
+  // After the admin creates a space: the result, and the link to pass on if email didn't go out.
+  function spaceCreated(k, line) {
+    const link = `${SITE}#/${k.spaceId}`;
+    const inviteLinkValue = k.invite?.link;
+    const emailed = k.invite ? k.invite.emailed : k.emailed;
+    const note = k.invite ? k.invite.emailNote : k.emailNote;
+    modal({
+      title: 'Space created',
+      html: `<p>${line} ${emailed ? 'We emailed them.' : esc(note || '')}</p>
+        ${inviteLinkValue ? copyField('Owner invite link (works only for their email address)', inviteLinkValue) : copyField('Space link', link)}
+        ${copyField('Reviewer link', reviewLink(k.spaceId, k.reviewCode))}`,
+      confirm: 'Done', cancel: false,
+      onSubmit: () => {},
+    });
   }
 
   function showKeys(k, { name = '', title = '' } = {}) {
@@ -1003,12 +1200,105 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     });
   }
 
+  /* ------------------------------------------------------------------ share */
+  async function loadMembers() {
+    try {
+      state.members = await api('GET', `/api/s/${spaceId()}/members`);
+    } catch (e) {
+      state.members = { error: e.message };
+    }
+    if ($('#share-dialog')) shareDialog();
+  }
+
+  // Share → Reviewers: the link (no account needed), or email it.
+  // Share → Team: owners and editors, pending invites, invite by email.
+  function shareDialog() {
+    const tab = state.shareTab;
+    const code = spaceCode();
+    const link = reviewLink(spaceId(), code);
+    const demo = state.project.space.kind === 'demo';
+    const owner = !!state.me.owner;
+    const res = state.shareResult;
+    const result = res ? `<div class="share-result ${res.emailed ? 'ok' : ''}">
+        <p>${res.emailed ? `${I.check}Sent to ${esc(res.email)}.` : esc(res.emailNote || '')}</p>
+        ${res.emailed ? '' : copyField(res.kind === 'invite' ? 'Invite link (works only for that email address)' : 'Reviewer link', res.link)}
+      </div>` : '';
+    const needSignIn = `<p class="muted">${CLERK_KEY ? '<button type="button" class="link-btn" data-action="sign-in">Sign in</button> to send email invites.' : 'Email invites need sign-in, which isn’t set up on this site.'}</p>`;
+
+    let body;
+    if (tab === 'reviewers') {
+      body = `<p>Anyone with this link can view the screenshots and comment. They don’t need an account.</p>
+        ${copyField('Reviewer link', link)}
+        ${copyField('Review code', code)}
+        ${signedIn() ? `<div class="field"><label for="share-email">Email the link to a reviewer</label>
+          <div class="cf-row"><input class="input" id="share-email" name="email" type="email" maxlength="200" placeholder="name@example.com" autocomplete="off">
+          <button type="submit" class="btn sm" data-send="reviewer">${I.mail}Send</button></div></div>` : needSignIn}
+        ${result}
+        ${demo ? `<p class="muted">The link stops working when the demo ends, in ${timeLeft(state.project.space.expiresAt)}.</p>` : ''}
+        <p class="muted">Need to cut off access? Use <b>New review code</b> in the ⋯ menu; old links stop working.</p>`;
+    } else if (demo) {
+      body = '<p>Demo spaces are for trying things out alone, so they can’t have editors. <button type="button" class="link-btn" data-action="request-space">Request a space</button> to work as a team.</p>';
+    } else {
+      const m = state.members;
+      const you = m?.you;
+      const rows = !m ? '<p class="muted">Loading…</p>' : m.error ? `<p class="err">${esc(m.error)}</p>` : `
+        <div class="member-list">${m.members.map((x) => `
+          <div class="member">
+            ${avatar(x.name || x.email)}
+            <div class="m-main"><b>${esc(x.name || x.email)}${x.id === you ? ' (you)' : ''}</b><span class="muted">${esc(x.email)}</span></div>
+            <span class="pill">${x.role === 'owner' ? 'Owner' : 'Editor'}</span>
+            ${owner && x.id !== you ? `<button type="button" class="link-btn" data-action="member-role" data-uid="${esc(x.id)}" data-role="${x.role === 'owner' ? 'editor' : 'owner'}">${x.role === 'owner' ? 'Make editor' : 'Make owner'}</button>
+              <button type="button" class="link-btn danger" data-action="member-remove" data-uid="${esc(x.id)}">Remove</button>` : ''}
+          </div>`).join('') || '<p class="muted">No members yet.</p>'}
+        ${m.invites.map((i) => `
+          <div class="member pending">
+            <div class="avatar" aria-hidden="true">${I.mail}</div>
+            <div class="m-main"><b>${esc(i.email)}</b><span class="muted">Invited ${esc(ago(i.createdAt))} · expires ${esc(ago(i.expiresAt))}</span></div>
+            <span class="pill">${i.role === 'owner' ? 'Owner' : 'Editor'}</span>
+            ${owner ? `<button type="button" class="link-btn danger" data-action="invite-revoke" data-iid="${esc(i.id)}">Cancel</button>` : ''}
+          </div>`).join('')}</div>`;
+      body = `<p>Owners and editors upload screenshots and manage feedback. Owners also manage the team.</p>
+        ${rows}
+        ${!signedIn() ? needSignIn : owner ? `<div class="field"><label for="share-email">Invite by email</label>
+          <div class="cf-row"><input class="input" id="share-email" name="email" type="email" maxlength="200" placeholder="name@example.com" autocomplete="off">
+          <select class="input role-select" name="role" aria-label="Role"><option value="editor">Editor</option><option value="owner">Owner</option></select>
+          <button type="submit" class="btn sm" data-send="team">${I.mail}Invite</button></div>
+          <small class="hint-text">They sign in with that email address to accept. Invites expire after 7 days.</small></div>` : '<p class="muted">Only owners can invite editors.</p>'}
+        ${result}`;
+    }
+
+    modal({
+      title: 'Share',
+      animate: !$('#share-dialog'),
+      html: `<div id="share-dialog"><div class="tabs sm" role="tablist">
+          <button type="button" role="tab" class="tab ${tab === 'reviewers' ? 'active' : ''}" aria-selected="${tab === 'reviewers'}" data-action="share-tab" data-tab="reviewers">Reviewers</button>
+          <button type="button" role="tab" class="tab ${tab === 'team' ? 'active' : ''}" aria-selected="${tab === 'team'}" data-action="share-tab" data-tab="team">Team</button>
+        </div>${body}</div>`,
+      confirm: tab === 'reviewers' ? 'Copy link' : 'Done', cancelLabel: 'Close', cancel: tab === 'reviewers',
+      onSubmit: async (v, submitter) => {
+        const kind = submitter?.dataset.send;
+        if (!kind) {
+          if (tab === 'reviewers') { await copyText(link); return false; }
+          return;
+        }
+        const email = String(v.email || '').trim();
+        if (!email) throw new Error('Enter an email address.');
+        const r = await api('POST', `/api/s/${spaceId()}/invites`, { email, role: kind === 'reviewer' ? 'reviewer' : v.role });
+        state.shareResult = { ...r, email };
+        if (kind === 'team') state.members = await api('GET', `/api/s/${spaceId()}/members`);
+        shareDialog();
+        return false;
+      },
+    });
+  }
+
   /* ------------------------------------------------------------------ modal */
   // onSubmit may return false to keep the modal open.
-  function modal({ title, text = '', html = '', fields = [], confirm = 'Save', cancel = true, cancelLabel = 'Cancel', danger = false, onSubmit }) {
+  // animate: false when redrawing a modal that is already open (e.g. switching tabs).
+  function modal({ title, text = '', html = '', fields = [], confirm = 'Save', cancel = true, cancelLabel = 'Cancel', danger = false, animate = true, onSubmit }) {
     const root = $('#modal-root');
     root.innerHTML = `
-      <div class="modal-backdrop">
+      <div class="modal-backdrop${animate ? '' : ' still'}">
         <form class="modal" novalidate role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <h3 id="modal-title">${esc(title)}</h3>
           ${text ? `<p>${text}</p>` : ''}
@@ -1041,7 +1331,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       const btn = form.querySelector('[type=submit]');
       btn.disabled = true;
       try {
-        const keep = await onSubmit(values);
+        const keep = await onSubmit(values, e.submitter);
         if (keep === false) btn.disabled = false; else if (root.contains(form)) close();
       } catch (ex) {
         err.textContent = ex.message; err.hidden = false; btn.disabled = false;
@@ -1062,7 +1352,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     'nav-image': (el) => navImage(Number(el.dataset.dir)),
     'reload': () => location.reload(),
     'refresh': () => load().then(() => toast('Up to date')),
-    'menu': () => { state.menuOpen = !state.menuOpen; render(); },
+    'menu': () => { state.menuOpen = state.menuOpen === 'space' ? false : 'space'; render(); },
     'copy': (el) => copyText(el.dataset.text),
 
     // home
@@ -1073,22 +1363,26 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       state.welcome = d.spaceId;
       nav(spaceHash(d.spaceId));
     }),
-    'request-space': () => modal({
-      title: 'Request a space',
-      text: 'Tell us a little about your project. An admin reviews each request; this browser gets a status page that shows your space key once it’s approved.',
-      fields: [
-        { name: 'name', label: 'Your name', required: true, max: 80, autocomplete: 'name' },
-        { name: 'email', label: 'Email', type: 'email', required: true, max: 200, autocomplete: 'email', hint: 'Only used to contact you about this request.' },
-        { name: 'organization', label: 'Company or team (optional)', max: 120, autocomplete: 'organization' },
-        { name: 'purpose', label: 'What will you review?', multiline: true, max: 1000, required: true, placeholder: 'e.g. App redesign for a client, around 60 screens over two months' },
-      ],
-      confirm: 'Send request',
-      onSubmit: async (v) => {
-        const r = await api('POST', '/api/requests', v, { space: null, headers: await humanCheck() });
-        saveRequests([...myRequests(), { id: r.id, token: r.token, createdAt: new Date().toISOString(), lastStatus: 'pending' }]);
-        nav(`#/r/${r.id}`);
-      },
-    }),
+    'request-space': () => {
+      if (!signedIn()) return signIn();
+      const email = clerk.user.primaryEmailAddress?.emailAddress || '';
+      modal({
+        title: 'Request a space',
+        text: `Tell us a little about your project. An admin reviews each request, and you become the owner of the space when it’s approved. We’ll email <b>${esc(email)}</b> about it.`,
+        fields: [
+          { name: 'organization', label: 'Company or team (optional)', max: 120, autocomplete: 'organization' },
+          { name: 'purpose', label: 'What will you review?', multiline: true, max: 1000, required: true, placeholder: 'e.g. App redesign for a client, around 60 screens over two months' },
+        ],
+        confirm: 'Send request',
+        onSubmit: async (v) => {
+          await api('POST', '/api/requests', v, { space: null });
+          await refreshAccount();
+          nav('#/');
+          render();
+          toast('Request sent. You’ll see the result here.');
+        },
+      });
+    },
     'check-request': () => openRequest(state.request.id),
     'drop-request': (el) => { saveRequests(myRequests().filter((r) => r.id !== el.dataset.id)); nav('#/'); },
     'forget-space': (el) => {
@@ -1100,21 +1394,52 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       } else doIt();
     },
 
+    // account
+    'sign-in': () => signIn(),
+    'sign-out': () => { state.menuOpen = false; clerk?.signOut(); },
+    'manage-account': () => { state.menuOpen = false; clerk?.openUserProfile(); },
+    'account-menu': () => { state.menuOpen = state.menuOpen === 'account' ? false : 'account'; render(); },
+    'accept-invite': () => run(async () => {
+      const r = await api('POST', `/api/invites/${encodeURIComponent(session.get('invite') || '')}/accept`, {}, { space: null });
+      session.set('invite', null);
+      await refreshAccount();
+      toast(`You’re now ${r.role === 'owner' ? 'an owner' : 'an editor'} of this space`);
+      nav(spaceHash(r.spaceId));
+    }),
+    'claim-space': () => confirmBox('Make your account the owner?', 'Your account becomes an owner of this space, and the space key stops working for you and anyone else using it. Invite teammates from <b>Share → Team</b> afterwards.', 'Make me the owner', async () => {
+      await api('POST', `/api/s/${spaceId()}/claim`, {});
+      creds.set(spaceId(), { key: null });
+      await refreshAccount();
+      toast('This space is now on your account');
+      openSpace(spaceId());
+    }),
+    'leave-space': () => confirmBox('Leave this space?', 'You lose access unless someone invites you again.', 'Leave', async () => {
+      await api('DELETE', `/api/s/${spaceId()}/members/${encodeURIComponent(clerk.user.id)}`);
+      await refreshAccount();
+      nav('#/');
+      toast('You left the space');
+    }),
+
     // space
-    'share': () => {
-      const code = spaceCode();
-      const demo = state.project.space.kind === 'demo';
-      modal({
-        title: 'Invite reviewers',
-        html: `<p>Anyone with this link can view the screenshots and comment. They don’t need an account.</p>
-          ${copyField('Reviewer link', reviewLink(spaceId(), code))}
-          ${copyField('Review code', code)}
-          ${demo ? `<p class="muted">The link stops working when the demo ends, in ${timeLeft(state.project.space.expiresAt)}.</p>` : ''}
-          <p class="muted">Need to cut off access? Use <b>New review code</b> in the ⋯ menu; old links stop working.</p>`,
-        confirm: 'Copy link', cancelLabel: 'Close',
-        onSubmit: async () => { await copyText(reviewLink(spaceId(), code)); return false; },
-      });
+    'share': () => { state.shareResult = null; shareDialog(); },
+    'share-tab': (el) => {
+      state.shareTab = el.dataset.tab;
+      state.shareResult = null;
+      shareDialog();
+      if (state.shareTab === 'team' && !state.members && state.project.space.kind !== 'demo') loadMembers();
     },
+    'member-role': (el) => run(async () => {
+      state.members = await api('PATCH', `/api/s/${spaceId()}/members/${encodeURIComponent(el.dataset.uid)}`, { role: el.dataset.role });
+      shareDialog();
+    }),
+    'member-remove': (el) => run(async () => {
+      state.members = await api('DELETE', `/api/s/${spaceId()}/members/${encodeURIComponent(el.dataset.uid)}`);
+      shareDialog();
+    }),
+    'invite-revoke': (el) => run(async () => {
+      state.members = await api('DELETE', `/api/s/${spaceId()}/invites/${encodeURIComponent(el.dataset.iid)}`);
+      shareDialog();
+    }),
     'rotate-code': () => confirmBox('Create a new review code?', 'Everyone using the current link or code loses access until you send them the new one.', 'New code', async () => {
       const r = await api('POST', `/api/s/${spaceId()}/rotate-code`);
       state.me.reviewCode = r.reviewCode;
@@ -1235,14 +1560,19 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     'pick-files': () => $('#file-input')?.click(),
 
     // site admin
-    'admin-tab': (el) => { state.adminTab = el.dataset.tab; render(); },
+    'admin-tab': (el) => {
+      state.adminTab = el.dataset.tab;
+      render();
+      if (state.adminTab === 'activity') loadAudit();
+    },
     'admin-refresh': () => openAdmin(),
-    'admin-out': () => { adminSignOut(); nav('#/'); },
     'approve': (el) => {
       const r = findReq(el.dataset.id);
       modal({
         title: `Approve ${r.name}’s request`,
-        text: 'This creates their space. You’ll see the keys next; the requester can also collect them once from their status page.',
+        text: r.userId
+          ? `This creates the space and makes <b>${esc(r.email)}</b> its owner. They get an email if email is set up.`
+          : 'This request was made before accounts: you’ll get a space key to pass on, and the requester can collect it once from their status page.',
         fields: [
           { name: 'title', label: 'Space name', value: r.organization || `${r.name}’s space`, required: true, max: 120 },
           { name: 'quotaMb', label: 'Storage (MB)', type: 'number', value: Math.round(state.overview.settings.spaceQuotaBytes / 1048576), required: true, max: 6 },
@@ -1251,7 +1581,8 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
         onSubmit: async (v) => {
           const k = await api('POST', `/api/admin/requests/${r.id}/approve`, v, { space: null });
           await openAdmin();
-          showKeys(k, { name: r.name, title: v.title });
+          if (k.legacy) showKeys(k, { name: r.name, title: v.title });
+          else spaceCreated(k, `${esc(r.email)} is the owner.`);
           return false;
         },
       });
@@ -1273,8 +1604,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       title: 'New space', text: 'Create a space directly, without a request.',
       fields: [
         { name: 'title', label: 'Space name', required: true, max: 120 },
-        { name: 'owner', label: 'Owner name (optional)', max: 80 },
-        { name: 'email', label: 'Owner email (optional)', type: 'email', max: 200 },
+        { name: 'email', label: 'Owner’s email (optional)', type: 'email', max: 200, hint: 'They get an invite to become the owner.' },
         { name: 'quotaMb', label: 'Storage (MB)', type: 'number', value: Math.round((state.overview?.settings.spaceQuotaBytes || 209715200) / 1048576), required: true, max: 6 },
       ],
       confirm: 'Create',
@@ -1282,7 +1612,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
         const k = await api('POST', '/api/admin/spaces', v, { space: null });
         state.adminTab = 'spaces';
         await openAdmin();
-        showKeys(k, { name: v.owner, title: v.title });
+        spaceCreated(k, k.invite ? `An owner invite went to ${esc(v.email)}.` : 'It has no owner yet: open it and invite one from Share → Team.');
         return false;
       },
     }),
@@ -1350,7 +1680,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     const key = form.dataset.key;
     const text = state.drafts[key]?.trim() || form.querySelector('textarea').value.trim();
     const nameInput = form.querySelector('[name=author]');
-    if (nameInput) {
+    if (nameInput && !signedIn()) {
       if (!nameInput.value.trim()) { nameInput.focus(); return toast('Please add your name so the team knows who commented', 'error'); }
       setName(nameInput.value);
     }
@@ -1515,7 +1845,11 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     const r = parseRoute();
     if (urlCode && r.view === 'space') creds.set(r.space, { code: urlCode });
     if (urlCode || params.has('admin')) {
-      history.replaceState(null, '', location.pathname + (params.has('admin') ? '#/admin' : location.hash));
+      const toAdmin = params.has('admin');
+      params.delete('code');
+      params.delete('admin');
+      const qs = params.toString(); // anything else (e.g. Clerk's) stays
+      history.replaceState(null, '', location.pathname + (qs ? `?${qs}` : '') + (toAdmin ? '#/admin' : location.hash));
     }
     api('GET', '/api/config', undefined, { space: null })
       .then((c) => { state.config = c; if (state.route.view === 'home') render(); })

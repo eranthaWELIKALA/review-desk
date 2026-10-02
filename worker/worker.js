@@ -15,26 +15,37 @@
  *   demos and rewrites this branch without history, so their files really go away.
  *     registry/demos.json               demos started in the last day (for rate limits)
  *
+ * Accounts, memberships, invites and the audit log live in D1 (binding DB, see
+ * migrations/). Sign-in is handled by Clerk: the site sends a short-lived Clerk
+ * session token as `Authorization: Bearer …`, verified here (RS256, iss, azp).
+ *
  * Who can do what:
- *   site admin    X-Admin-Session: as.<exp>.<mac>  approve requests, manage every space
- *                 (from POST /api/admin/session with ADMIN_KEY, plus a TOTP code
- *                 when ADMIN_TOTP_SECRET is set; valid for one hour)
- *   space admin   X-Space-Key: sk-<id>-<mac>       upload, edit, resolve in one space
- *   reviewer      X-Review-Code: per-space code    view and comment in one space
- *   images        /img/…?t=<exp>.<mac>             short-lived token from /me, so the
- *                                                  review code never goes in a URL
+ *   site admin   signed in with an email in SITE_ADMIN_EMAILS (and MFA, unless
+ *                ADMIN_REQUIRE_MFA=false): approve requests, manage every space
+ *   owner        member with role 'owner': everything in the space, invite editors
+ *   editor       member with role 'editor': upload, edit, resolve, invite reviewers
+ *   reviewer     anyone with the review link (X-Review-Code): view and comment,
+ *                with or without an account
+ *   demo owner   X-Space-Key: sk-<id>-<mac>, demos only (no account needed)
+ * Approved spaces created before accounts still have space keys; a signed-in user
+ * can claim ownership with one (POST /api/s/<id>/claim). Keys keep working for
+ * editing until LEGACY_SPACE_KEYS=false.
+ * Images use /img/…?t=<exp>.<mac>, a short-lived token from /me, so the review
+ * code never goes in a URL.
+ *
  * Space keys and review codes are HMACs of the space id under SPACE_SECRET, so no
  * secret is written to the repo. Bumping keyVersion / codeVersion rotates them.
- * Admin sessions, image tokens and the IP salt use their own keys derived from
- * SPACE_SECRET with HKDF.
+ * Image tokens, the IP salt and the email hash use their own HKDF subkeys.
  *
  * Abuse controls: wrong credentials and writes are rate limited per IP (the
- * AUTH_LIMIT and WRITE_LIMIT bindings, or an in-memory fallback), and demo and
- * request creation need a Turnstile token when TURNSTILE_SECRET is set.
+ * AUTH_LIMIT and WRITE_LIMIT bindings, or an in-memory fallback), demo creation
+ * needs a Turnstile token when TURNSTILE_SECRET is set, and email has daily caps.
  *
- * Secrets:  GITHUB_TOKEN, ADMIN_KEY, SPACE_SECRET, ADMIN_TOTP_SECRET (optional),
+ * Secrets:  GITHUB_TOKEN, SPACE_SECRET, SITE_ADMIN_EMAILS, RESEND_API_KEY (optional),
  *           TURNSTILE_SECRET (optional)
  * Vars:     GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, DEMO_BRANCH, ALLOWED_ORIGINS,
+ *           SITE_URL, CLERK_ISSUER, CLERK_JWT_KEY (optional, PEM), EMAIL_FROM,
+ *           EMAIL_DAILY_LIMIT, ADMIN_REQUIRE_MFA, LEGACY_SPACE_KEYS,
  *           DEMO_ENABLED, DEMO_QUOTA_MB, DEMO_HOURS, DEMO_MAX_ACTIVE, DEMO_PER_IP_PER_DAY,
  *           SPACE_QUOTA_MB, MAX_PENDING_REQUESTS, TURNSTILE_SITE_KEY,
  *           RATE_AUTH_PER_MIN, RATE_WRITES_PER_MIN (in-memory fallback only)
@@ -59,7 +70,10 @@ const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L
 // Review code scheme 2: 12 characters (~59 bits) without modulo bias. Spaces
 // created before it keep their 8-character code until it is rotated.
 const CODE_SCHEME = 2;
-const ADMIN_SESSION_MS = 60 * 60e3;
+const INVITE_DAYS = 7;
+const INVITES_PER_SPACE_PER_DAY = 30;
+const EMAILS_PER_RECIPIENT_PER_DAY = 5;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const IMAGE_TOKEN_STEP_MS = 12 * 3600e3; // tokens last 12–24 h and stay stable for 12 h, so images cache
 // Magic bytes for each upload type, so a file can't pretend to be an image.
 const IMAGE_MAGIC = {
@@ -87,6 +101,7 @@ const SECURITY_HEADERS = {
 export default {
   async fetch(request, env) {
     const requestId = crypto.randomUUID();
+    requestIds.set(request, requestId);
     const cors = corsHeaders(env, request.headers.get('Origin'));
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors, ...SECURITY_HEADERS } });
 
@@ -108,12 +123,15 @@ export default {
     return new Response(res.body, { status: res.status, headers });
   },
 
-  // Cron trigger (see wrangler.toml): delete expired demo spaces.
+  // Cron trigger (see wrangler.toml): delete expired demo spaces, prune old D1 rows.
   async scheduled(event, env, ctx) {
     checkEnv(env);
     ctx.waitUntil(cleanupDemos(env).catch((err) => console.error('demo cleanup failed', err)));
+    ctx.waitUntil(pruneD1(env).catch((err) => console.error('D1 prune failed', err)));
   },
 };
+
+const requestIds = new WeakMap(); // request -> id, for logs and the audit table
 
 /* ------------------------------------------------------------------ routing */
 
@@ -134,14 +152,18 @@ async function route(request, env) {
   if (method !== 'GET') await limitWrites(env, request);
 
   if (a === 'config' && method === 'GET') return json(publicConfig(env));
+  if (a === 'me' && !rest.length && method === 'GET') return json(await accountOverview(env, request));
+  if (a === 'invites' && rest[0]) {
+    if (rest.length === 1 && method === 'GET') return json(await invitePreview(env, rest[0]));
+    if (rest[1] === 'accept' && rest.length === 2 && method === 'POST') return json(await acceptInvite(env, request, rest[0]));
+  }
   if (a === 'demo' && method === 'POST') {
     await verifyTurnstile(env, request);
     return json(await createDemo(env, request), 201);
   }
   if (a === 'requests') return requestRoutes(request, env, rest, method);
   if (a === 'admin') {
-    if (rest[0] === 'session' && rest.length === 1 && method === 'POST') return json(await adminSignIn(env, request), 201);
-    if (!(await isSiteAdmin(request, env))) throw new HttpError(403, 'Site admin sign-in required');
+    if (!(await isSiteAdmin(request, env))) throw new HttpError(403, 'Site admins only. Sign in with an admin account (with two-step verification).');
     return adminRoutes(request, env, rest, method);
   }
   if (a === 's' && rest[0]) return spaceRoutes(request, env, rest[0], rest.slice(1), method);
@@ -153,10 +175,17 @@ async function spaceRoutes(request, env, id, p, method) {
   const { sp } = ctx;
   const [a, b, c, d, e] = p;
 
+  if (a === 'claim' && !b && method === 'POST') return json(await claimSpace(env, request, ctx));
+
   if (a === 'me' && method === 'GET') {
     return json({
       admin: ctx.admin,
+      owner: ctx.owner,
+      role: ctx.role,
       siteAdmin: ctx.site,
+      signedIn: !!ctx.user,
+      // An approved space with a valid key but no owner account yet can be claimed.
+      canClaim: !!ctx.user && ctx.keyValid && !isDemoId(id) && ctx.member !== 'owner',
       authorized: ctx.reviewer,
       space: ctx.reviewer ? publicSpace(ctx.idx) : { id, kind: ctx.idx.kind, expiresAt: ctx.idx.expiresAt || null },
       // Admins need the code to build share links.
@@ -166,13 +195,27 @@ async function spaceRoutes(request, env, id, p, method) {
   }
 
   if (!ctx.reviewer) throw new HttpError(401, 'Review code required');
-  const needAdmin = () => { if (!ctx.admin) throw new HttpError(403, 'Space key required'); };
+  const needAdmin = () => { if (!ctx.admin) throw new HttpError(403, 'Only owners and editors can do this'); };
+  const needOwner = () => { if (!ctx.owner) throw new HttpError(403, 'Only owners can do this'); };
+
+  if (a === 'members' && !b && method === 'GET') { needAdmin(); return json(await listMembers(env, ctx)); }
+  if (a === 'members' && b && !c) {
+    if (method === 'PATCH') { needOwner(); return json(await setMemberRole(env, request, ctx, b, await readBody(request))); }
+    // Owners remove anyone; anyone can leave.
+    if (method === 'DELETE') {
+      if (!ctx.owner && ctx.user?.id !== b) throw new HttpError(403, 'Only owners can do this');
+      return json(await removeMember(env, request, ctx, b));
+    }
+  }
+  if (a === 'invites' && !b && method === 'POST') { needAdmin(); return json(await createInvite(env, request, ctx, await readBody(request)), 201); }
+  if (a === 'invites' && b && !c && method === 'DELETE') { needOwner(); return json(await revokeInvite(env, request, ctx, b)); }
 
   if (!a && method === 'DELETE') {
     // Demo owners can delete their demo early; approved spaces are deleted by the site admin.
     needAdmin();
     if (ctx.idx.kind !== 'demo' && !ctx.site) throw new HttpError(403, 'Ask the site admin to delete this space');
     await deleteSpace(env, id);
+    await audit(env, request, 'space.delete', { actor: ctx.user?.id, spaceId: id });
     return json({ ok: true });
   }
 
@@ -213,7 +256,7 @@ async function spaceRoutes(request, env, id, p, method) {
       if (d && !e && method === 'DELETE') { needAdmin(); return json(await deleteImage(env, sp, b, d)); }
     }
     if (b && c === 'comments') {
-      if (!d && method === 'POST') return json(await addComment(env, sp, b, await readBody(request)), 201);
+      if (!d && method === 'POST') return json(await addComment(env, sp, b, await readBody(request), ctx.user), 201);
       if (d && !e && method === 'PATCH') { needAdmin(); return json(await updateComment(env, sp, b, d, await readBody(request))); }
       if (d && !e && method === 'DELETE') { needAdmin(); return json(await deleteComment(env, sp, b, d)); }
     }
@@ -223,10 +266,8 @@ async function spaceRoutes(request, env, id, p, method) {
 
 async function requestRoutes(request, env, p, method) {
   const [id, action] = p;
-  if (!id && method === 'POST') {
-    await verifyTurnstile(env, request);
-    return json(await createRequest(env, request), 201);
-  }
+  if (!id && method === 'POST') return json(await createRequest(env, request), 201);
+  // Requests made before accounts: the browser that sent it holds a status token.
   if (id && action === 'status' && method === 'POST') return json(await requestStatus(env, id, await readBody(request)));
   throw new HttpError(404, 'Not found');
 }
@@ -237,20 +278,26 @@ async function adminRoutes(request, env, p, method) {
   if (a === 'cleanup' && !id && method === 'POST') return json(await cleanupDemos(env));
 
   if (a === 'requests' && id) {
-    if (action === 'approve' && method === 'POST') return json(await approveRequest(env, id, await readBody(request)), 201);
-    if (action === 'reject' && method === 'POST') return json(await rejectRequest(env, id, await readBody(request)));
+    if (action === 'approve' && method === 'POST') return json(await approveRequest(env, request, id, await readBody(request)), 201);
+    if (action === 'reject' && method === 'POST') return json(await rejectRequest(env, request, id, await readBody(request)));
     if (!action && method === 'DELETE') return json(await deleteRequest(env, id));
   }
+  if (a === 'audit' && !id && method === 'GET') return json(await auditLog(env, new URL(request.url).searchParams.get('space')));
 
   if (a === 'spaces') {
-    if (!id && method === 'POST') return json(await adminCreateSpace(env, await readBody(request)), 201);
+    if (!id && method === 'POST') return json(await adminCreateSpace(env, request, await readBody(request)), 201);
     if (id && !SPACE_RE.test(id)) throw new HttpError(400, 'Bad space id');
     if (id && !action) {
       if (method === 'GET') return json(await adminSpaceInfo(env, id));
       if (method === 'PATCH') return json(await adminUpdateSpace(env, id, await readBody(request)));
-      if (method === 'DELETE') { await deleteSpace(env, id); return json({ ok: true }); }
+      if (method === 'DELETE') {
+        await deleteSpace(env, id);
+        await audit(env, request, 'space.delete', { actor: (await currentUser(env, request))?.id, spaceId: id });
+        return json({ ok: true });
+      }
     }
     if (id && action === 'keys' && method === 'GET') {
+      await audit(env, request, 'space.view_keys', { actor: (await currentUser(env, request))?.id, spaceId: id });
       const idx = must(await readJson(env, branchFor(env, id), `spaces/${id}/index.json`), 'Space');
       return json(await keysFor(env, idx));
     }
@@ -262,6 +309,7 @@ async function adminRoutes(request, env, p, method) {
         return x;
       }, 'admin: new space key');
       authCache.delete(id);
+      await audit(env, request, 'space.rotate_key', { actor: (await currentUser(env, request))?.id, spaceId: id });
       return json(await keysFor(env, idx));
     }
   }
@@ -302,7 +350,8 @@ function publicConfig(env) {
     demo: { enabled: s.demoEnabled, quotaBytes: s.demoQuota, hours: s.demoHours },
     spaceQuotaBytes: s.spaceQuota,
     turnstileSiteKey: env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY ? env.TURNSTILE_SITE_KEY : null,
-    adminOtp: !!env.ADMIN_TOTP_SECRET,
+    emailEnabled: !!(env.RESEND_API_KEY && env.EMAIL_FROM),
+    clerkIssuer: env.CLERK_ISSUER || null,
   };
 }
 
@@ -329,12 +378,18 @@ async function spaceFor(env, id) {
 
 async function access(request, env, id) {
   const { sp, idx } = await spaceFor(env, id);
+  const user = await currentUser(env, request);
   const site = await isSiteAdmin(request, env);
+  const role = user ? await memberRole(env, id, user.id) : null;
   const key = request.headers.get('X-Space-Key');
-  const admin = site || (!!key && await checkCredential(env, request, `${id}:k`, key, () => spaceKey(env, id, idx.keyVersion)));
+  const keyValid = !!key && await checkCredential(env, request, `${id}:k`, key, () => spaceKey(env, id, idx.keyVersion));
+  // Demos are always run by key. Approved spaces accept keys until LEGACY_SPACE_KEYS=false.
+  const keyOk = keyValid && (isDemoId(id) || env.LEGACY_SPACE_KEYS !== 'false');
+  const owner = site || role === 'owner' || keyOk;
+  const admin = owner || role === 'editor';
   const code = normCode(request.headers.get('X-Review-Code'));
   const reviewer = admin || (!!code && await checkCredential(env, request, `${id}:c`, code, () => reviewCode(env, id, idx)));
-  return { sp, idx, site, admin, reviewer };
+  return { sp, idx, user, site, member: role, role: site ? 'site-admin' : role || (keyOk ? 'owner' : null), owner, admin, reviewer, keyValid };
 }
 
 /**
@@ -487,69 +542,90 @@ async function validImageToken(env, idx, token) {
   return safeEqual(m[2], await imageMac(env, idx, exp));
 }
 
-/* ------------------------------------------------------------ site admin auth */
+/* ------------------------------------------------------------------ sign-in */
 
 /**
- * The admin key is sent once, to POST /api/admin/session, and exchanged for a
- * signed session that expires after an hour. Every attempt costs an AUTH_LIMIT
- * unit, right or wrong. With ADMIN_TOTP_SECRET set, an authenticator code is
- * required too.
+ * The signed-in user, from a Clerk session token in `Authorization: Bearer`.
+ * Returns null when there is no token. A token that is present but invalid or
+ * expired is a 401, so the site knows to refresh it. Cached per request.
  */
-async function adminSignIn(env, request) {
-  if (!(await allow(env, 'AUTH_LIMIT', await ipHash(env, request), env.RATE_AUTH_PER_MIN, 20))) {
-    throw new HttpError(429, 'Too many attempts. Please wait a minute and try again.');
-  }
-  const body = await readBody(request);
-  const keyOk = safeEqual(String(body.key || ''), env.ADMIN_KEY);
-  const otpOk = !env.ADMIN_TOTP_SECRET || (await validTotp(env.ADMIN_TOTP_SECRET, String(body.otp || '')));
-  if (!keyOk || !otpOk) {
-    console.warn(JSON.stringify({ event: 'admin_sign_in_failed', ip: await ipHash(env, request), at: now() }));
-    throw new HttpError(403, env.ADMIN_TOTP_SECRET ? 'That key or authenticator code is not correct.' : 'That key is not correct.');
-  }
-  console.log(JSON.stringify({ event: 'admin_sign_in', ip: await ipHash(env, request), at: now() }));
-  const exp = Date.now() + ADMIN_SESSION_MS;
-  return { session: `as.${exp.toString(36)}.${await adminMac(env, exp)}`, expiresAt: new Date(exp).toISOString() };
+const userCache = new WeakMap();
+function currentUser(env, request) {
+  if (!userCache.has(request)) userCache.set(request, verifySession(env, request));
+  return userCache.get(request);
 }
 
-// Bound to ADMIN_KEY too, so changing the key signs every admin out.
-const adminMac = async (env, exp) =>
-  b64url(await hmacRaw(await subkey(env, 'admin-session'), `admin:${exp}:${await sha256hex(env.ADMIN_KEY)}`)).slice(0, 32);
+async function verifySession(env, request) {
+  const h = request.headers.get('Authorization') || '';
+  if (!h) return null;
+  const m = h.match(/^Bearer ([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/);
+  const bad = (why) => {
+    console.warn(JSON.stringify({ event: 'session_rejected', why, requestId: requestIds.get(request) }));
+    return new HttpError(401, 'Your sign-in has expired. Please sign in again.');
+  };
+  if (!m) throw bad('format');
+  let header, claims;
+  try {
+    header = JSON.parse(b64urlText(m[1]));
+    claims = JSON.parse(b64urlText(m[2]));
+  } catch { throw bad('json'); }
+  if (header.alg !== 'RS256') throw bad('alg');
+  const key = await clerkKey(env, header.kid);
+  if (!key || !(await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, b64urlBytes(m[3]), enc.encode(`${m[1]}.${m[2]}`)))) throw bad('signature');
+  const t = Date.now() / 1000;
+  if (!(claims.exp > t - 5) || (claims.nbf && claims.nbf > t + 5)) throw bad('expired');
+  if (claims.iss !== env.CLERK_ISSUER) throw bad('issuer');
+  // azp is the site origin that asked Clerk for the token: it stops tokens minted
+  // for some other site on the same Clerk instance from working here.
+  const origins = allowedOrigins(env);
+  if (!origins.includes('*') && !origins.includes(claims.azp)) throw bad('azp');
+  if (claims.sts && claims.sts !== 'active') throw bad('status');
+  const email = String(claims.email || '').trim().toLowerCase();
+  if (!claims.sub || !EMAIL_RE.test(email)) {
+    throw new HttpError(401, 'Your sign-in doesn’t include an email address. (Admin: add the email claim to the Clerk session token; see README.)');
+  }
+  return {
+    id: String(claims.sub),
+    email,
+    name: cleanText(String(claims.name || '').slice(0, 200), 200, 'Name', true).slice(0, MAX_NAME),
+    // fva = [minutes since first factor, minutes since second factor]; -1 = never.
+    mfa: Array.isArray(claims.fva) && Number(claims.fva[1]) >= 0,
+  };
+}
 
+// Clerk's public key: CLERK_JWT_KEY (PEM) when set, else the issuer's JWKS, cached an hour.
+const jwksCache = { at: 0, keys: new Map(), url: '' };
+async function clerkKey(env, kid) {
+  if (env.CLERK_JWT_KEY) {
+    if (jwksCache.url !== `pem:${env.CLERK_JWT_KEY}`) {
+      const der = Uint8Array.from(atob(env.CLERK_JWT_KEY.replace(/-----[^-]+-----|\s/g, '')), (c) => c.charCodeAt(0));
+      jwksCache.keys = new Map([['*', await crypto.subtle.importKey('spki', der, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify'])]]);
+      jwksCache.url = `pem:${env.CLERK_JWT_KEY}`;
+    }
+    return jwksCache.keys.get('*');
+  }
+  const url = `${env.CLERK_ISSUER}/.well-known/jwks.json`;
+  const stale = jwksCache.url !== url || Date.now() - jwksCache.at > 3600e3;
+  // An unknown kid can mean Clerk rotated its keys: refetch, at most once a minute.
+  if (stale || (!jwksCache.keys.has(kid) && Date.now() - jwksCache.at > 60e3)) {
+    const res = await fetch(url);
+    if (!res.ok) throw new HttpError(502, `Clerk JWKS fetch failed (${res.status})`);
+    const keys = new Map();
+    for (const jwk of (await res.json()).keys || []) {
+      if (jwk.kty === 'RSA') keys.set(jwk.kid, await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']));
+    }
+    Object.assign(jwksCache, { at: Date.now(), keys, url });
+  }
+  return jwksCache.keys.get(kid) || null;
+}
+const b64urlBytes = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
+const b64urlText = (s) => new TextDecoder().decode(b64urlBytes(s));
+
+const siteAdminEmails = (env) => String(env.SITE_ADMIN_EMAILS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
 async function isSiteAdmin(request, env) {
-  const m = String(request.headers.get('X-Admin-Session') || '').match(/^as\.([a-z0-9]{1,12})\.([A-Za-z0-9_-]{32})$/);
-  if (!m) return false;
-  const exp = parseInt(m[1], 36);
-  if (!(exp > Date.now()) || exp - Date.now() > ADMIN_SESSION_MS) return false;
-  return safeEqual(m[2], await adminMac(env, exp));
-}
-
-/** RFC 6238 TOTP (SHA-1, 6 digits, 30 s), accepting one step of clock drift either way. */
-async function validTotp(secretB32, code) {
-  if (!/^\d{6}$/.test(code)) return false;
-  const key = base32Decode(secretB32);
-  const step = Math.floor(Date.now() / 30_000);
-  let ok = false;
-  for (const s of [step - 1, step, step + 1]) {
-    const msg = new Uint8Array(8);
-    new DataView(msg.buffer).setBigUint64(0, BigInt(s));
-    const h = await hmacRaw(key, msg, 'SHA-1');
-    const o = h[h.length - 1] & 0xf;
-    const n = (((h[o] & 0x7f) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 1e6;
-    ok = safeEqual(String(n).padStart(6, '0'), code) || ok; // check every step: no timing hint
-  }
-  return ok;
-}
-function base32Decode(s) {
-  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  const clean = String(s).toUpperCase().replace(/[^A-Z2-7]/g, '');
-  const out = [];
-  let bits = 0, val = 0;
-  for (const ch of clean) {
-    val = (val << 5) | alpha.indexOf(ch);
-    bits += 5;
-    if (bits >= 8) { out.push((val >>> (bits - 8)) & 0xff); bits -= 8; }
-  }
-  return new Uint8Array(out);
+  const user = await currentUser(env, request);
+  if (!user || !siteAdminEmails(env).includes(user.email)) return false;
+  return env.ADMIN_REQUIRE_MFA === 'false' || user.mfa;
 }
 
 async function sha256hex(s) {
@@ -623,6 +699,10 @@ async function deleteSpace(env, id) {
       return reg;
     }, 'admin: unlist space', true);
   }
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM members WHERE space_id = ?').bind(id),
+    env.DB.prepare('UPDATE invites SET revoked_at = ? WHERE space_id = ? AND accepted_at IS NULL AND revoked_at IS NULL').bind(now(), id),
+  ]);
   authCache.delete(id);
 }
 
@@ -661,28 +741,32 @@ async function cleanupDemos(env) {
 
 /* ----------------------------------------------------------------- requests */
 
+/** A signed-in user asks for a space. Name and email come from their account. */
 async function createRequest(env, request) {
   const s = settings(env);
+  const user = await currentUser(env, request);
+  if (!user) throw new HttpError(401, 'Please sign in to request a space.');
   const body = await readBody(request);
-  const name = cleanText(body.name, 80, 'Name');
-  const email = cleanText(body.email, 200, 'Email');
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new HttpError(400, 'Please enter a valid email address');
   const organization = cleanText(body.organization || '', 120, 'Organization', true);
   const purpose = cleanText(body.purpose, 1000, 'Purpose', false, true);
+  const plan = body.plan === undefined ? '' : cleanText(body.plan, 40, 'Plan', true);
+  await ensureUser(env, user);
   const who = await ipHash(env, request);
-  const token = randomToken();
-  const tokenHash = await sha256hex(token);
   const id = newId();
 
   await updateJson(env, dataBranch(env), REQUESTS_REG, (reg) => {
     reg = reg || { requests: [] };
     const pending = reg.requests.filter((r) => r.status === 'pending');
     if (pending.length >= s.maxPending) throw new HttpError(429, 'We have a lot of requests waiting. Please try again in a few days.');
-    if (pending.filter((r) => r.ipHash === who).length >= 3) throw new HttpError(429, 'You already have requests waiting for review.');
-    reg.requests.push({ id, name, email, organization, purpose, status: 'pending', createdAt: now(), ipHash: who, tokenHash });
+    if (pending.filter((r) => r.userId === user.id || r.ipHash === who).length >= 3) throw new HttpError(429, 'You already have requests waiting for review.');
+    reg.requests.push({
+      id, userId: user.id, name: user.name || user.email, email: user.email, organization, purpose,
+      ...(plan ? { plan } : {}), status: 'pending', createdAt: now(), ipHash: who,
+    });
     return reg;
   }, 'requests: new space request', true);
-  return { id, token, status: 'pending' };
+  await audit(env, request, 'request.create', { actor: user.id, detail: { requestId: id } });
+  return { id, status: 'pending' };
 }
 
 async function findRequest(env, id) {
@@ -690,7 +774,10 @@ async function findRequest(env, id) {
   return reg?.requests.find((r) => r.id === id) || null;
 }
 
-/** Requester's view. Keys of an approved space are handed out once, then hidden. */
+/**
+ * Status of a request made before accounts, for the browser holding its token.
+ * Keys of an approved space are handed out once, then hidden.
+ */
 async function requestStatus(env, id, body) {
   const r = await findRequest(env, id);
   if (!r || !r.tokenHash || !safeEqual(await sha256hex(String(body.token || '')), r.tokenHash)) {
@@ -721,8 +808,13 @@ const quotaFrom = (mb, fallback) => {
   return Math.round(n * MB);
 };
 
-async function approveRequest(env, id, body) {
+/**
+ * Creates the space and makes the requester its owner, then emails them. Requests
+ * from before accounts have no user: the admin gets the space key to pass on.
+ */
+async function approveRequest(env, request, id, body) {
   const s = settings(env);
+  const admin = await currentUser(env, request);
   const quotaBytes = quotaFrom(body.quotaMb, s.spaceQuota);
   const spaceId = newSpaceId('s');
   let req;
@@ -738,6 +830,7 @@ async function approveRequest(env, id, body) {
   let created;
   try {
     created = await createSpace(env, spaceId, { kind: 'space', title, quotaBytes });
+    if (req.userId) await addMember(env, spaceId, req.userId, 'owner', 'request');
   } catch (err) {
     await updateJson(env, dataBranch(env), REQUESTS_REG, (reg) => {
       const r = reg.requests.find((x) => x.id === id);
@@ -747,18 +840,31 @@ async function approveRequest(env, id, body) {
     throw err;
   }
   await registerSpace(env, { id: spaceId, title, owner: req.name, email: req.email, requestId: id });
-  return created;
+  await audit(env, request, 'request.approve', { actor: admin?.id, spaceId, detail: { requestId: id } });
+  if (!req.userId) return { ...created, legacy: true };
+
+  const mail = await sendEmail(env, request, {
+    kind: 'request-approved', to: req.email, spaceId,
+    ...emailRequestApproved({ title, link: spaceLink(env, spaceId) }),
+  });
+  const { adminKey: _k, ...rest } = created;
+  return { ...rest, owner: req.email, ...mail };
 }
 
-async function rejectRequest(env, id, body) {
+async function rejectRequest(env, request, id, body) {
   const reason = cleanText(body.reason || '', 500, 'Reason', true, true);
+  let req;
   await updateJson(env, dataBranch(env), REQUESTS_REG, (reg) => {
-    const r = must(reg?.requests.find((x) => x.id === id), 'Request');
-    if (r.status !== 'pending') throw new HttpError(409, `This request was already ${r.status}`);
-    Object.assign(r, { status: 'rejected', reason, decidedAt: now() });
+    req = must(reg?.requests.find((x) => x.id === id), 'Request');
+    if (req.status !== 'pending') throw new HttpError(409, `This request was already ${req.status}`);
+    Object.assign(req, { status: 'rejected', reason, decidedAt: now() });
     return reg;
   }, 'requests: reject');
-  return { ok: true };
+  await audit(env, request, 'request.reject', { actor: (await currentUser(env, request))?.id, detail: { requestId: id } });
+  const mail = req.userId
+    ? await sendEmail(env, request, { kind: 'request-rejected', to: req.email, ...emailRequestRejected({ reason }) })
+    : {};
+  return { ok: true, ...mail };
 }
 
 async function deleteRequest(env, id) {
@@ -780,15 +886,21 @@ async function registerSpace(env, entry) {
   }, 'admin: list space', true);
 }
 
-async function adminCreateSpace(env, body) {
+/** The admin creates a space and, optionally, invites its owner by email. */
+async function adminCreateSpace(env, request, body) {
+  const admin = await currentUser(env, request);
   const title = cleanText(body.title, 120, 'Title');
-  const owner = cleanText(body.owner || '', 80, 'Owner', true);
-  const email = cleanText(body.email || '', 200, 'Email', true);
+  const email = cleanText(body.email || '', 200, 'Email', true).toLowerCase();
+  if (email && !EMAIL_RE.test(email)) throw new HttpError(400, 'Please enter a valid email address');
   const quotaBytes = quotaFrom(body.quotaMb, settings(env).spaceQuota);
   const id = newSpaceId('s');
-  const created = await createSpace(env, id, { kind: 'space', title, quotaBytes });
-  await registerSpace(env, { id, title, owner, email, requestId: null });
-  return created;
+  const { adminKey: _k, ...created } = await createSpace(env, id, { kind: 'space', title, quotaBytes });
+  await registerSpace(env, { id, title, owner: '', email, requestId: null });
+  await audit(env, request, 'space.create', { actor: admin.id, spaceId: id });
+  if (!email) return created;
+  await ensureUser(env, admin);
+  const invite = await makeInvite(env, request, { spaceId: id, title, email, role: 'owner', inviter: admin });
+  return { ...created, invite };
 }
 
 async function adminOverview(env) {
@@ -826,6 +938,391 @@ async function adminUpdateSpace(env, id, body) {
     return x;
   }, 'admin: update space');
   return { ...publicSpace(idx), sections: idx.sections.length };
+}
+
+/* ----------------------------------------------------------------- accounts */
+
+const siteUrl = (env) => (env.SITE_URL.endsWith('/') ? env.SITE_URL : `${env.SITE_URL}/`);
+const spaceLink = (env, id) => `${siteUrl(env)}#/${id}`;
+const reviewLinkFor = (env, id, code) => `${siteUrl(env)}?code=${encodeURIComponent(code)}#/${id}`;
+// The token sits in the fragment, so it is never sent to a server or in a Referer.
+const inviteLink = (env, token) => `${siteUrl(env)}#/invite/${token}`;
+const displayName = (user) => user?.name || user?.email || 'Someone';
+const TOKEN_RE = /^[A-Za-z0-9_-]{32}$/;
+
+function maskEmail(email) {
+  const [local, domain] = String(email).split('@');
+  return `${local.slice(0, 2)}${'*'.repeat(Math.max(1, local.length - 2))}@${domain}`;
+}
+
+/** Keeps the users row in step with Clerk (email and name can change there). */
+async function ensureUser(env, user) {
+  await env.DB.prepare(`INSERT INTO users (id, email, name, created_at, last_seen) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET email = excluded.email, name = excluded.name, last_seen = excluded.last_seen`)
+    .bind(user.id, user.email, user.name, now(), now()).run();
+}
+
+async function memberRole(env, spaceId, userId) {
+  return (await env.DB.prepare('SELECT role FROM members WHERE space_id = ? AND user_id = ?').bind(spaceId, userId).first('role')) || null;
+}
+
+// Adds a member; an existing owner is never demoted by a later editor invite.
+function addMemberStmt(env, spaceId, userId, role, addedBy) {
+  return env.DB.prepare(`INSERT INTO members (space_id, user_id, role, added_by, created_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (space_id, user_id) DO UPDATE SET role = CASE WHEN members.role = 'owner' THEN 'owner' ELSE excluded.role END`)
+    .bind(spaceId, userId, role, addedBy, now());
+}
+const addMember = (env, ...args) => addMemberStmt(env, ...args).run();
+
+/** GET /api/me: who is signed in, their spaces and their space requests. */
+async function accountOverview(env, request) {
+  const user = await currentUser(env, request);
+  if (!user) return { signedIn: false };
+  await ensureUser(env, user);
+  const [rows, reg, reqs] = await Promise.all([
+    env.DB.prepare('SELECT space_id, role, created_at FROM members WHERE user_id = ? ORDER BY created_at DESC').bind(user.id).all(),
+    readJson(env, dataBranch(env), SPACES_REG),
+    readJson(env, dataBranch(env), REQUESTS_REG),
+  ]);
+  const titles = new Map((reg?.spaces || []).map((x) => [x.id, x.title]));
+  const isAdminEmail = siteAdminEmails(env).includes(user.email);
+  return {
+    signedIn: true,
+    user: { id: user.id, email: user.email, name: user.name },
+    siteAdmin: await isSiteAdmin(request, env),
+    // Lets the site explain why an admin account isn't getting the console.
+    adminNeedsMfa: isAdminEmail && !user.mfa && env.ADMIN_REQUIRE_MFA !== 'false',
+    spaces: rows.results.filter((r) => titles.has(r.space_id)).map((r) => ({ id: r.space_id, title: titles.get(r.space_id), role: r.role })),
+    requests: (reqs?.requests || []).filter((r) => r.userId === user.id).reverse().map((r) => ({
+      id: r.id, status: r.status, organization: r.organization, createdAt: r.createdAt,
+      decidedAt: r.decidedAt || null, reason: r.reason || '', spaceId: r.spaceId || null,
+    })),
+  };
+}
+
+/* ------------------------------------------------------------------ members */
+
+async function listMembers(env, ctx) {
+  const id = ctx.sp.id;
+  const [members, invites] = await Promise.all([
+    env.DB.prepare(`SELECT m.user_id AS id, m.role, m.created_at AS addedAt, u.email, u.name
+      FROM members m JOIN users u ON u.id = m.user_id WHERE m.space_id = ? ORDER BY m.created_at`).bind(id).all(),
+    env.DB.prepare(`SELECT id, email, role, created_at AS createdAt, expires_at AS expiresAt FROM invites
+      WHERE space_id = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ? ORDER BY created_at DESC`).bind(id, now()).all(),
+  ]);
+  return { members: members.results, invites: invites.results, you: ctx.user?.id || null };
+}
+
+// "Not the last owner" is checked inside the same statement, so two owners can't
+// both step down at once and leave the space without one.
+const LAST_OWNER_GUARD = `(role <> 'owner' OR (SELECT COUNT(*) FROM members WHERE space_id = ?1 AND role = 'owner') > 1)`;
+
+async function setMemberRole(env, request, ctx, userId, body) {
+  const role = body.role;
+  if (!['owner', 'editor'].includes(role)) throw new HttpError(400, 'Role must be owner or editor');
+  const r = await env.DB.prepare(`UPDATE members SET role = ?3 WHERE space_id = ?1 AND user_id = ?2 AND (?3 = 'owner' OR ${LAST_OWNER_GUARD})`)
+    .bind(ctx.sp.id, userId, role).run();
+  if (!r.meta.changes) {
+    if (!(await memberRole(env, ctx.sp.id, userId))) throw new HttpError(404, 'Member not found');
+    throw new HttpError(409, 'A space needs at least one owner');
+  }
+  await audit(env, request, 'member.role', { actor: ctx.user?.id, spaceId: ctx.sp.id, detail: { userId, role } });
+  return listMembers(env, ctx);
+}
+
+async function removeMember(env, request, ctx, userId) {
+  const r = await env.DB.prepare(`DELETE FROM members WHERE space_id = ?1 AND user_id = ?2 AND ${LAST_OWNER_GUARD}`).bind(ctx.sp.id, userId).run();
+  if (!r.meta.changes) {
+    if (!(await memberRole(env, ctx.sp.id, userId))) throw new HttpError(404, 'Member not found');
+    throw new HttpError(409, 'A space needs at least one owner');
+  }
+  await audit(env, request, ctx.user?.id === userId ? 'member.leave' : 'member.remove', { actor: ctx.user?.id, spaceId: ctx.sp.id, detail: { userId } });
+  return listMembers(env, ctx);
+}
+
+/* ------------------------------------------------------------------ invites */
+
+/**
+ * POST /api/s/<id>/invites { email, role }.
+ *   reviewer        emails the review link (no account needed); owners and editors
+ *   editor / owner  emails a single-use invite for that address; owners only
+ * The response always includes the link, so it can be shared another way when
+ * email isn't set up or fails.
+ */
+async function createInvite(env, request, ctx, body) {
+  if (!ctx.user) throw new HttpError(401, 'Please sign in to invite people.');
+  const email = cleanText(body.email, 200, 'Email').toLowerCase();
+  if (!EMAIL_RE.test(email)) throw new HttpError(400, 'Please enter a valid email address');
+  const { id } = ctx.sp;
+
+  if (body.role === 'reviewer') {
+    const code = formatCode(await reviewCode(env, id, ctx.idx));
+    const link = reviewLinkFor(env, id, code);
+    // Demos need no approval, so they don't get to send email on our behalf.
+    if (isDemoId(id)) return { kind: 'review-link', link, emailed: false, emailNote: 'Demo spaces can’t send email, so copy the link and send it yourself.' };
+    const mail = await sendEmail(env, request, {
+      kind: 'review-link', to: email, spaceId: id,
+      ...emailReviewLink({ inviter: displayName(ctx.user), title: ctx.idx.title, link, code }),
+    });
+    await audit(env, request, 'invite.reviewer', { actor: ctx.user.id, spaceId: id, detail: { emailed: mail.emailed } });
+    return { kind: 'review-link', link, ...mail };
+  }
+
+  if (!['owner', 'editor'].includes(body.role)) throw new HttpError(400, 'Role must be reviewer, editor or owner');
+  if (!ctx.owner) throw new HttpError(403, 'Only owners can invite editors and owners');
+  if (isDemoId(id)) throw new HttpError(400, 'Demo spaces can’t have editors. Request a space to work as a team.');
+  const existing = await env.DB.prepare('SELECT m.role FROM members m JOIN users u ON u.id = m.user_id WHERE m.space_id = ? AND u.email = ?').bind(id, email).first('role');
+  if (existing === 'owner' || existing === body.role) throw new HttpError(409, 'That person is already a member');
+  await ensureUser(env, ctx.user);
+  return { kind: 'invite', ...(await makeInvite(env, request, { spaceId: id, title: ctx.idx.title, email, role: body.role, inviter: ctx.user })) };
+}
+
+async function makeInvite(env, request, { spaceId, title, email, role, inviter }) {
+  const since = new Date(Date.now() - 86400e3).toISOString();
+  const recent = await env.DB.prepare('SELECT COUNT(*) AS n FROM invites WHERE space_id = ? AND created_at > ?').bind(spaceId, since).first('n');
+  if (recent >= INVITES_PER_SPACE_PER_DAY) throw new HttpError(429, `A space can send up to ${INVITES_PER_SPACE_PER_DAY} invites a day.`);
+
+  const token = randomToken();
+  const id = newId();
+  const createdAt = now();
+  const expiresAt = new Date(Date.now() + INVITE_DAYS * 86400e3).toISOString();
+  // A new invite replaces any pending one for the same person.
+  await env.DB.batch([
+    env.DB.prepare('UPDATE invites SET revoked_at = ? WHERE space_id = ? AND email = ? AND accepted_at IS NULL AND revoked_at IS NULL').bind(createdAt, spaceId, email),
+    env.DB.prepare(`INSERT INTO invites (id, space_id, email, role, token_hash, invited_by, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, spaceId, email, role, await sha256hex(token), inviter.id, createdAt, expiresAt),
+  ]);
+  const link = inviteLink(env, token);
+  const mail = await sendEmail(env, request, {
+    kind: 'invite', to: email, spaceId,
+    ...emailInvite({ inviter: displayName(inviter), title, role, link, expiresAt }),
+  });
+  await audit(env, request, 'invite.create', { actor: inviter.id, spaceId, detail: { inviteId: id, role, emailed: mail.emailed } });
+  return { invite: { id, email, role, createdAt, expiresAt }, link, ...mail };
+}
+
+async function revokeInvite(env, request, ctx, inviteId) {
+  const r = await env.DB.prepare('UPDATE invites SET revoked_at = ? WHERE id = ? AND space_id = ? AND accepted_at IS NULL AND revoked_at IS NULL')
+    .bind(now(), inviteId, ctx.sp.id).run();
+  if (!r.meta.changes) throw new HttpError(404, 'Invite not found');
+  await audit(env, request, 'invite.revoke', { actor: ctx.user?.id, spaceId: ctx.sp.id, detail: { inviteId } });
+  return listMembers(env, ctx);
+}
+
+async function findInvite(env, token) {
+  if (!TOKEN_RE.test(String(token))) throw new HttpError(404, 'This invite link isn’t valid. Check that you copied all of it.');
+  const row = await env.DB.prepare(`SELECT i.*, u.name AS inviter_name, u.email AS inviter_email FROM invites i
+    LEFT JOIN users u ON u.id = i.invited_by WHERE i.token_hash = ?`).bind(await sha256hex(token)).first();
+  if (!row) throw new HttpError(404, 'This invite link isn’t valid. Check that you copied all of it.');
+  const status = row.accepted_at ? 'accepted' : row.revoked_at ? 'revoked' : row.expires_at <= now() ? 'expired' : 'pending';
+  return { row, status };
+}
+
+/** GET /api/invites/<token>: what the invite is for, before signing in. */
+async function invitePreview(env, token) {
+  const { row, status } = await findInvite(env, token);
+  const idx = await readJson(env, dataBranch(env), `spaces/${row.space_id}/index.json`);
+  if (!idx) throw new HttpError(410, 'The space this invite was for has been deleted.');
+  return {
+    spaceId: row.space_id, title: idx.title, role: row.role, status, expiresAt: row.expires_at,
+    inviter: row.inviter_name || row.inviter_email || 'Someone', email: maskEmail(row.email),
+  };
+}
+
+/** POST /api/invites/<token>/accept: only works for the invited email address. */
+async function acceptInvite(env, request, token) {
+  const user = await currentUser(env, request);
+  if (!user) throw new HttpError(401, 'Please sign in to accept this invite.');
+  const { row, status } = await findInvite(env, token);
+  if (status !== 'pending') throw new HttpError(410, `This invite has ${status === 'accepted' ? 'already been used' : status === 'revoked' ? 'been cancelled' : 'expired'}. Ask for a new one.`);
+  if (row.email !== user.email) {
+    await audit(env, request, 'invite.wrong_account', { actor: user.id, spaceId: row.space_id, detail: { inviteId: row.id } });
+    throw new HttpError(403, `This invite was sent to ${maskEmail(row.email)}. Sign in with that email address to accept it.`);
+  }
+  await ensureUser(env, user);
+  // Mark it used first: of two simultaneous accepts, only one changes the row.
+  const used = await env.DB.prepare('UPDATE invites SET accepted_at = ?, accepted_by = ? WHERE id = ? AND accepted_at IS NULL AND revoked_at IS NULL')
+    .bind(now(), user.id, row.id).run();
+  if (!used.meta.changes) throw new HttpError(410, 'This invite has already been used.');
+  await addMember(env, row.space_id, user.id, row.role, row.invited_by);
+  await audit(env, request, 'invite.accept', { actor: user.id, spaceId: row.space_id, detail: { inviteId: row.id, role: row.role } });
+  return { spaceId: row.space_id, role: row.role };
+}
+
+/**
+ * POST /api/s/<id>/claim with X-Space-Key: a signed-in user who holds the key of
+ * an approved space becomes an owner. The key is then rotated, so it stops working;
+ * teammates who used it get invited instead.
+ */
+async function claimSpace(env, request, ctx) {
+  if (!ctx.user) throw new HttpError(401, 'Please sign in first.');
+  if (isDemoId(ctx.sp.id)) throw new HttpError(400, 'Demo spaces can’t be claimed. Request a space to keep your work.');
+  if (!ctx.keyValid) throw new HttpError(403, 'That space key is not correct.');
+  await ensureUser(env, ctx.user);
+  await addMember(env, ctx.sp.id, ctx.user.id, 'owner', 'claim');
+  await updateJson(env, ctx.sp.br, indexPath(ctx.sp), (x) => {
+    must(x, 'Space');
+    x.keyVersion = (x.keyVersion || 1) + 1;
+    return x;
+  }, 'review: space claimed, key retired');
+  authCache.delete(ctx.sp.id);
+  await audit(env, request, 'space.claim', { actor: ctx.user.id, spaceId: ctx.sp.id });
+  return { ok: true, role: 'owner' };
+}
+
+/* -------------------------------------------------------------------- audit */
+
+/** Appends to the audit table. Never fails the request: a failure is logged instead. */
+async function audit(env, request, action, { actor, spaceId, detail } = {}) {
+  try {
+    await env.DB.prepare('INSERT INTO audit (at, request_id, actor, ip_hash, action, space_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .bind(now(), requestIds.get(request) || null, actor || 'anon', await ipHash(env, request), action, spaceId || null,
+        detail ? JSON.stringify(detail).slice(0, 2000) : null)
+      .run();
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'audit_write_failed', action, error: String(err?.message || err) }));
+  }
+}
+
+async function auditLog(env, spaceId) {
+  const where = spaceId ? 'WHERE a.space_id = ?' : '';
+  const stmt = env.DB.prepare(`SELECT a.at, a.action, a.space_id AS spaceId, a.detail, a.request_id AS requestId,
+    COALESCE(u.email, a.actor) AS actor FROM audit a LEFT JOIN users u ON u.id = a.actor ${where} ORDER BY a.id DESC LIMIT 200`);
+  const rows = (await (spaceId ? stmt.bind(spaceId) : stmt).all()).results;
+  return { entries: rows.map((r) => ({ ...r, detail: r.detail ? JSON.parse(r.detail) : null })) };
+}
+
+// Hourly: drop email logs after 30 days, finished invites after 90, audit entries after a year.
+async function pruneD1(env) {
+  const ago = (days) => new Date(Date.now() - days * 86400e3).toISOString();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM email_log WHERE at < ?').bind(ago(30)),
+    env.DB.prepare('DELETE FROM invites WHERE COALESCE(accepted_at, revoked_at, expires_at) < ?').bind(ago(90)),
+    env.DB.prepare('DELETE FROM audit WHERE at < ?').bind(ago(365)),
+  ]);
+}
+
+/* -------------------------------------------------------------------- email */
+
+/**
+ * Sends one email through Resend. Never throws: the caller gets { emailed, emailNote }
+ * and always has a link to share another way. Limits: EMAIL_DAILY_LIMIT in total
+ * (default 90, under Resend's free 100/day) and a few per recipient per day.
+ */
+async function sendEmail(env, request, { kind, to, subject, text, html, spaceId }) {
+  const toHash = b64url(await hmacRaw(await subkey(env, 'email-hash'), to.toLowerCase())).slice(0, 22);
+  const log = (status) => env.DB.prepare('INSERT INTO email_log (at, kind, space_id, to_hash, status) VALUES (?, ?, ?, ?, ?)')
+    .bind(now(), kind, spaceId || null, toHash, status).run().catch(() => {});
+  const skip = async (emailNote) => { await log('skipped'); return { emailed: false, emailNote }; };
+
+  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return skip('Email isn’t set up yet, so copy the link and send it yourself.');
+  const since = new Date(Date.now() - 86400e3).toISOString();
+  const [total, mine, fromSpace] = await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) AS n FROM email_log WHERE at > ? AND status = 'sent'").bind(since).first('n'),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM email_log WHERE at > ? AND to_hash = ? AND status = 'sent'").bind(since, toHash).first('n'),
+    spaceId ? env.DB.prepare("SELECT COUNT(*) AS n FROM email_log WHERE at > ? AND space_id = ? AND status = 'sent'").bind(since, spaceId).first('n') : 0,
+  ]);
+  if (total >= (Number(env.EMAIL_DAILY_LIMIT) > 0 ? Number(env.EMAIL_DAILY_LIMIT) : 90)) return skip('Today’s email limit is reached, so copy the link and send it yourself.');
+  if (mine >= EMAILS_PER_RECIPIENT_PER_DAY) return skip('That address has had several emails from us today, so copy the link and send it yourself.');
+  // One space can't use up everyone's daily allowance.
+  if (fromSpace >= INVITES_PER_SPACE_PER_DAY) return skip('This space has sent a lot of email today, so copy the link and send it yourself.');
+
+  let ok = false;
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `${requestIds.get(request) || newId()}-${kind}-${toHash}`,
+      },
+      body: JSON.stringify({ from: env.EMAIL_FROM, to: [to], subject: oneLine(subject, 150), text, html }),
+    });
+    ok = res.ok;
+    if (!ok) console.error(JSON.stringify({ event: 'email_failed', kind, status: res.status, body: (await res.text()).slice(0, 300) }));
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'email_failed', kind, error: String(err?.message || err) }));
+  }
+  await log(ok ? 'sent' : 'failed');
+  return ok ? { emailed: true } : { emailed: false, emailNote: 'The email couldn’t be sent, so copy the link and send it yourself.' };
+}
+
+const oneLine = (s, max) => String(s).replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim().slice(0, max);
+const escHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const quoteTitle = (t) => `“${oneLine(t, 60)}”`;
+const fmtDate = (iso) => new Date(iso).toUTCString().replace(/ \d\d:\d\d:\d\d GMT$/, '');
+
+// Plain text plus simple HTML. User-supplied text (names, titles, reasons) is escaped.
+function emailBody({ heading, lines, button, footer }) {
+  const text = [heading, '', ...lines, '', button ? `${button.label}: ${button.url}` : '', '', footer].filter((x) => x !== undefined).join('\n');
+  const html = `<!doctype html><html><body style="margin:0;padding:24px;background:#f6f5f4;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1e1c1a">
+<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:12px;padding:28px">
+<h1 style="font-size:18px;margin:0 0 16px">${escHtml(heading)}</h1>
+${lines.map((l) => `<p style="font-size:15px;line-height:1.5;margin:0 0 12px">${escHtml(l)}</p>`).join('\n')}
+${button ? `<p style="margin:20px 0"><a href="${escHtml(button.url)}" style="background:#e8590c;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:600;display:inline-block">${escHtml(button.label)}</a></p>
+<p style="font-size:12px;color:#6b6560;word-break:break-all">Or paste this link into your browser: ${escHtml(button.url)}</p>` : ''}
+<p style="font-size:12px;color:#6b6560;margin-top:20px">${escHtml(footer)}</p>
+</div></body></html>`;
+  return { text, html };
+}
+
+const IGNORE = 'If you weren’t expecting this, you can ignore this email.';
+
+function emailInvite({ inviter, title, role, link, expiresAt }) {
+  const what = role === 'owner' ? 'an owner of' : 'an editor of';
+  return {
+    subject: `${oneLine(inviter, 60)} invited you to ${quoteTitle(title)} on Review Desk`,
+    ...emailBody({
+      heading: `You’re invited to ${quoteTitle(title)}`,
+      lines: [
+        `${oneLine(inviter, 60)} invited you to be ${what} this space on Review Desk, where your team collects feedback on screenshots.`,
+        `Sign in with this email address to accept. The invite expires on ${fmtDate(expiresAt)}.`,
+      ],
+      button: { label: 'Accept the invite', url: link },
+      footer: IGNORE,
+    }),
+  };
+}
+
+function emailReviewLink({ inviter, title, link }) {
+  return {
+    subject: `${oneLine(inviter, 60)} asked for your feedback on ${quoteTitle(title)}`,
+    ...emailBody({
+      heading: `Your feedback on ${quoteTitle(title)}`,
+      lines: [
+        `${oneLine(inviter, 60)} shared screenshots with you on Review Desk and would like your comments.`,
+        'Open the link to view them and comment on a whole section or on an exact spot. You don’t need an account.',
+      ],
+      button: { label: 'Open the screenshots', url: link },
+      footer: `Anyone with this link can view and comment, so please don’t forward it. ${IGNORE}`,
+    }),
+  };
+}
+
+function emailRequestApproved({ title, link }) {
+  return {
+    subject: `Your Review Desk space ${quoteTitle(title)} is ready`,
+    ...emailBody({
+      heading: 'Your space is ready',
+      lines: [`Your request was approved. You’re the owner of ${quoteTitle(title)}: sign in to upload screenshots and invite your team.`],
+      button: { label: 'Open your space', url: link },
+      footer: 'You’re getting this because you requested a space on Review Desk.',
+    }),
+  };
+}
+
+function emailRequestRejected({ reason }) {
+  return {
+    subject: 'About your Review Desk space request',
+    ...emailBody({
+      heading: 'We couldn’t approve your request',
+      lines: [
+        'Thanks for your interest in Review Desk. We weren’t able to approve your space request this time.',
+        ...(reason ? [`Reason: ${oneLine(reason, 500)}`] : []),
+      ],
+      footer: 'You’re getting this because you requested a space on Review Desk.',
+    }),
+  };
 }
 
 /* ----------------------------------------------------------------- handlers */
@@ -962,8 +1459,9 @@ async function deleteImage(env, sp, sectionId, imageId) {
   return section;
 }
 
-async function addComment(env, sp, sectionId, body) {
-  const author = cleanText(body.author, MAX_NAME, 'Name');
+/** Signed-in people comment under their account name; others type a name. */
+async function addComment(env, sp, sectionId, body, user) {
+  const author = user ? displayName(user).slice(0, MAX_NAME) : cleanText(body.author, MAX_NAME, 'Name');
   const text = cleanText(body.text, MAX_COMMENT, 'Comment', false, true);
   const parentId = body.parentId ? String(body.parentId) : null;
 
@@ -983,7 +1481,7 @@ async function addComment(env, sp, sectionId, body) {
         pin = { x: clamp(body.pin.x), y: clamp(body.pin.y) };
       }
     }
-    s.comments.push({ id: newId(), target, parentId, author, text, pin, createdAt: now(), resolved: false });
+    s.comments.push({ id: newId(), target, parentId, author, ...(user ? { authorId: user.id, verified: true } : {}), text, pin, createdAt: now(), resolved: false });
     return s;
   }, `review: comment by ${forCommit(author)}`);
 }
@@ -1207,20 +1705,21 @@ function githubHint(status, op) {
 /* ------------------------------------------------------------------ helpers */
 
 function checkEnv(env) {
-  const missing = ['GITHUB_TOKEN', 'GITHUB_OWNER', 'GITHUB_REPO', 'ADMIN_KEY', 'SPACE_SECRET'].filter((k) => !env[k]);
+  const missing = ['GITHUB_TOKEN', 'GITHUB_OWNER', 'GITHUB_REPO', 'SPACE_SECRET', 'CLERK_ISSUER', 'SITE_URL', 'DB'].filter((k) => !env[k]);
   if (missing.length) throw new HttpError(500, `Worker not configured: missing ${missing.join(', ')}`);
 }
 
 // Only origins listed in ALLOWED_ORIGINS get CORS headers; unset means no browser
 // origin is allowed. '*' is for local development only.
+const allowedOrigins = (env) => String(env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
 function corsHeaders(env, origin) {
-  const allowed = String(env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const allowed = allowedOrigins(env);
   const allow = allowed.includes('*') ? '*' : (origin && allowed.includes(origin) ? origin : null);
   if (!allow) return { Vary: 'Origin' };
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Session, X-Space-Key, X-Review-Code, X-Turnstile-Token',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Space-Key, X-Review-Code, X-Turnstile-Token',
     'Access-Control-Expose-Headers': 'X-Request-Id, Retry-After',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
@@ -1281,7 +1780,7 @@ function must(value, label) {
 }
 
 const fmtMB = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
-const now = () => new Date().toISOString();
+const now = () => new Date(Date.now()).toISOString();
 const pretty = (o) => JSON.stringify(o, null, 2) + '\n';
 function newId() {
   const rand = crypto.getRandomValues(new Uint8Array(6));

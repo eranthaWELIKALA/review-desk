@@ -15,8 +15,26 @@ GITHUB_BRANCH = "review-data"
 # Demo spaces live here; the Worker creates it on first use and rewrites it
 # without history during cleanup, so deleted demos don't linger in git.
 DEMO_BRANCH = "demo-data"
-# Your GitHub Pages origin. Comma-separate several.
+# Your GitHub Pages origin. Comma-separate several. Also checked against the
+# `azp` claim of Clerk session tokens.
 ALLOWED_ORIGINS = "https://eranthawelikala.github.io"
+# The site's address, used for links in emails (never taken from the request).
+SITE_URL = "https://eranthawelikala.github.io/review-desk/"
+
+# Sign-in (Clerk). The Frontend API URL of your Clerk instance, from the Clerk
+# dashboard: API keys → "Frontend API URL". Session tokens are checked against it
+# and its JWKS. Set CLERK_JWT_KEY (the PEM public key, same page) to skip the JWKS fetch.
+CLERK_ISSUER = "https://REPLACE-ME.clerk.accounts.dev"
+# Site admins (SITE_ADMIN_EMAILS, a secret) must have two-step verification on.
+ADMIN_REQUIRE_MFA = "true"
+# Space keys of approved spaces made before accounts still allow editing until
+# this is "false". Owners claim their space with the key once, then it's retired.
+LEGACY_SPACE_KEYS = "true"
+
+# Email (Resend). Until you verify a domain in Resend, only onboarding@resend.dev
+# works, and only to your own Resend account's address.
+EMAIL_FROM = "Review Desk <onboarding@resend.dev>"
+EMAIL_DAILY_LIMIT = "90"      # Resend free plan: 100/day
 
 # Demo spaces: anyone can start one, no account.
 DEMO_ENABLED = "true"
@@ -29,9 +47,18 @@ DEMO_PER_IP_PER_DAY = "3"
 SPACE_QUOTA_MB = "200"
 MAX_PENDING_REQUESTS = "50"
 
-# Turnstile ("are you human" check) on demo and space requests. Optional: set the
+# Turnstile ("are you human" check) on starting a demo. Optional: set the
 # site key here and TURNSTILE_SECRET as a secret to turn it on.
 # TURNSTILE_SITE_KEY = "0x4AAAA..."
+
+# Accounts, memberships, invites, email log and audit log.
+#   npx wrangler d1 create review-desk        → paste the database_id below
+#   npx wrangler d1 migrations apply review-desk --remote
+[[d1_databases]]
+binding = "DB"
+database_name = "review-desk"
+database_id = "REPLACE-WITH-DATABASE-ID"
+migrations_dir = "migrations"
 
 # Per-IP rate limits (per Cloudflare location, approximate). Without these bindings
 # the Worker falls back to an in-memory counter per isolate (RATE_AUTH_PER_MIN /
@@ -52,9 +79,8 @@ namespace_id = "1002"
 
 # Secrets — set with `npx wrangler secret put <NAME>`, never commit them:
 #   GITHUB_TOKEN       fine-grained token, data repo only, Contents: Read and write
-#   ADMIN_KEY          long random string (32+ chars); exchanged for a 1-hour admin session
 #   SPACE_SECRET       long random string; space keys, review codes, image tokens and the
 #                      IP salt are derived from it. Changing it invalidates them all at once.
-#   ADMIN_TOTP_SECRET  optional, base32; when set, admin sign-in also needs an
-#                      authenticator-app code (recommended)
+#   SITE_ADMIN_EMAILS  comma-separated emails of site admins (a secret so it isn't public)
+#   RESEND_API_KEY     optional; without it, invites give a link to share yourself
 #   TURNSTILE_SECRET   optional; see TURNSTILE_SITE_KEY above

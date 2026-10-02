@@ -455,3 +455,31 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 /* Turnstile check: only shows itself when Cloudflare needs the visitor to click. */
 .turnstile { position: fixed; left: 50%; bottom: calc(16px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 1000; }
+
+/* Accounts: sign-in button, team list, share results */
+.account-btn { gap: 8px; padding-left: 4px; }
+.account-btn .avatar { width: 24px; height: 24px; font-size: 10.5px; }
+.verified { display: inline-flex; width: 14px; height: 14px; margin-left: 4px; color: var(--ok); vertical-align: -2px; }
+.verified svg { width: 14px; height: 14px; }
+.strip-claim { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.strip-claim svg { width: 15px; height: 15px; color: var(--accent); }
+.strip .strip-claim .link-btn { margin-left: 0; color: var(--accent-text); }
+.notice-box.warn { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: var(--radius); background: var(--accent-soft); color: var(--text); margin: 0 0 20px; }
+.notice-box.warn svg { width: 18px; height: 18px; flex: none; color: var(--accent); margin-top: 1px; }
+.tabs.sm { margin-bottom: 14px; }
+.tabs.sm .tab { padding: 8px 12px; }
+.member-list { display: grid; gap: 2px; margin: 4px 0 14px; }
+.member { display: flex; align-items: center; gap: 10px; padding: 8px 0; flex-wrap: wrap; }
+.member + .member { border-top: 1px solid var(--border); }
+.member .m-main { display: grid; min-width: 0; flex: 1; }
+.member .m-main b, .member .m-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member .m-main span { font-size: 12.5px; }
+.member.pending .avatar { background: var(--surface-2); color: var(--text-2); }
+.member.pending .avatar svg { width: 15px; height: 15px; }
+.role-select { flex: none; width: auto; min-width: 92px; height: 34px; padding: 0 8px; font-size: 12.5px; }
+.modal-backdrop.still, .modal-backdrop.still .modal { animation: none; }
+.share-result { margin: 4px 0 12px; padding: 10px 12px; border-radius: var(--radius); background: var(--surface-2); }
+.share-result p { margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
+.share-result.ok { background: var(--ok-soft); }
+.share-result.ok p { margin: 0; }
+.share-result svg { width: 15px; height: 15px; color: var(--ok); }
