@@ -27,8 +27,20 @@ GitHub Pages can only serve static files and can't keep a secret, so a small fre
 | Approve/reject requests, create spaces, change storage, issue new space keys | | | ✓ |
 
 - **Space key** (`sk-<space>-…`): the owner's password for one space. It's shown once when the space is created: on the requester's status page and in the admin's "Space keys" dialog.
-- **Review code** (`ABCD-EFGH`): lets people view and comment. The reviewer link has it built in: `…/review-desk/?code=ABCD-EFGH#/<space>`.
+- **Review code** (`ABCD-EFGH-JKMN`, 12 characters): lets people view and comment. The reviewer link has it built in: `…/review-desk/?code=ABCD-EFGH-JKMN#/<space>`. Spaces created before 12-character codes keep their 8-character code until the owner issues a new one.
 - Both are derived from `SPACE_SECRET` (HMAC), so **no key or code is ever stored in the repo**. Issuing a new one invalidates the old one within a minute.
+- **Admin sign-in:** the admin key is sent once and exchanged for a **one-hour session** kept only in that browser tab. With `ADMIN_TOTP_SECRET` set, sign-in also needs a code from an authenticator app.
+
+## Security controls
+
+- **Rate limits per visitor (IP):** credential checks (20/min) and writes (30/min). Once a visitor runs out, every guess is refused, right or wrong. Known-good codes don't count.
+- **Images** are fetched with a short-lived token (12–24 h) from `/me`, never the review code, so codes don't end up in logs, history or caches. A new review code also cuts off old image links.
+- **Uploads** must really be PNG, JPG, GIF or WebP (checked by their first bytes, not the file name). Request bodies are capped while they stream in.
+- **Text** has control characters removed; names and titles are kept to one line, and user text in git commit messages is shortened and sanitised.
+- **Errors** from the server show only a reference ID (`X-Request-Id`); the details go to the Worker log (`npx wrangler tail`). Admin sign-ins and failed attempts are logged too.
+- **Headers:** a Content-Security-Policy on the site (`docs/index.html`; keep its Worker URL in sync with `config.js`), `Referrer-Policy: no-referrer`, and `nosniff`, a strict CSP and HSTS on every API response. CORS allows only `ALLOWED_ORIGINS`.
+- **Turnstile** (optional): set `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET` to require an "are you human" check before starting a demo or requesting a space.
+- **Not yet:** clickjacking protection (`frame-ancestors`) needs a custom domain, because GitHub Pages can't send headers. Keys and codes in `localStorage` share the `<user>.github.io` origin with your other Pages sites until then.
 
 ## Pages
 
@@ -86,10 +98,14 @@ Edit `worker/wrangler.toml` (`GITHUB_OWNER`, `GITHUB_REPO`, `ALLOWED_ORIGINS`, d
 npx wrangler secret put GITHUB_TOKEN   # the token from step 2
 npx wrangler secret put ADMIN_KEY      # long random string: the site admin key
 npx wrangler secret put SPACE_SECRET   # long random string: never share, never change casually
+npx wrangler secret put ADMIN_TOTP_SECRET   # optional, recommended: base32 secret for your authenticator app
 npx wrangler deploy
 ```
 
 To generate a random string: `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`
+
+To generate a TOTP secret, then add it to your authenticator app as a "setup key" (time-based, 6 digits):
+`node -e "const a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';console.log(Array.from(require('crypto').randomBytes(20),b=>a[b&31]).join(''))"`
 
 ### 4. Publish the site
 
@@ -119,11 +135,14 @@ Every change in a space is a commit (`review: comment by Nimal`). When two peopl
 | Name | Kind | Default | Purpose |
 |---|---|---|---|
 | `GITHUB_TOKEN` | secret | | Fine-grained token, Contents read/write on the data repo |
-| `ADMIN_KEY` | secret | | Site admin console |
-| `SPACE_SECRET` | secret | | Derives space keys and review codes. Changing it invalidates all of them |
+| `ADMIN_KEY` | secret | | Site admin sign-in. Changing it signs every admin session out |
+| `ADMIN_TOTP_SECRET` | secret | | Optional. Base32; requires an authenticator code at admin sign-in |
+| `SPACE_SECRET` | secret | | Derives space keys, review codes, image tokens and the IP salt. Changing it invalidates all of them |
+| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET` | var / secret | | Optional. Turnstile check on demo and space requests |
+| `AUTH_LIMIT` / `WRITE_LIMIT` | rate-limit binding | 20 / 30 per min | Per-IP limits. Without the bindings, an in-memory fallback uses `RATE_AUTH_PER_MIN` / `RATE_WRITES_PER_MIN` |
 | `GITHUB_OWNER`, `GITHUB_REPO` | var | | The data repo |
 | `GITHUB_BRANCH` / `DEMO_BRANCH` | var | `review-data` / `demo-data` | Branches for spaces and demos |
-| `ALLOWED_ORIGINS` | var | `*` | Your Pages origin(s), comma-separated |
+| `ALLOWED_ORIGINS` | var | none (deny) | Your Pages origin(s), comma-separated. `*` only for local dev |
 | `DEMO_ENABLED` | var | `true` | Turn demos off with `false` |
 | `DEMO_QUOTA_MB` / `DEMO_HOURS` | var | `5` / `24` | Demo storage and lifetime |
 | `DEMO_MAX_ACTIVE` | var | `30` | Demo spaces alive at once, across everyone |

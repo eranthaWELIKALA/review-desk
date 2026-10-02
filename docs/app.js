@@ -23,13 +23,16 @@
     setJson(k, v) { this.set(k, v == null ? null : JSON.stringify(v)); },
   };
 
-  // The site admin key lives only in this tab's sessionStorage, so it is gone when
-  // the tab closes and never sits in long-lived storage on a shared origin.
+  // The site admin session (never the admin key itself) lives only in this tab's
+  // sessionStorage, so it is gone when the tab closes and expires within an hour.
   const session = {
     get(k) { try { return sessionStorage.getItem('rd:' + k); } catch { return null; } },
     set(k, v) { try { v == null ? sessionStorage.removeItem('rd:' + k) : sessionStorage.setItem('rd:' + k, v); } catch { /* private mode */ } },
   };
-  store.set('siteKey', null); // purge the copy older versions kept in localStorage
+  store.set('siteKey', null);   // purge the raw key older versions kept in localStorage
+  session.set('siteKey', null); // …and in sessionStorage
+  // Admin sessions look like as.<expiry, base 36>.<mac>.
+  const sessionExpiry = (t) => parseInt(String(t || '').split('.')[1] || '0', 36) || 0;
 
   // Keys and review codes per space, remembered on this device only.
   const creds = {
@@ -52,7 +55,7 @@
     config: null,
     me: null,
     project: null,
-    siteKey: session.get('siteKey') || '',
+    siteSession: session.get('siteSession') || '',
     overview: null,
     usage: {},           // space id -> admin info (usage), loaded lazily
     adminTab: 'requests',
@@ -127,10 +130,13 @@
   }
   const spaceId = () => state.route.space;
   const spaceCode = () => state.me?.reviewCode || creds.get(spaceId()).code || '';
+  // Image links carry a short-lived token from /me, never the review code.
   function imageUrl(img) {
-    const code = spaceCode();
-    return `${API}/img/${spaceId()}/${img.path.split('/').map(encodeURIComponent).join('/')}${code ? `?code=${encodeURIComponent(code)}` : ''}`;
+    const t = state.me?.imageToken;
+    return `${API}/img/${spaceId()}/${img.path.split('/').map(encodeURIComponent).join('/')}${t ? `?t=${encodeURIComponent(t)}` : ''}`;
   }
+  // Image tokens look like <expiry, base 36>.<mac>; renew one that ends within the hour.
+  const imageTokenExpiring = () => (parseInt(String(state.me?.imageToken || '').split('.')[0], 36) || 0) - Date.now() < 3600e3;
   const reviewLink = (id, code, rest = '') => `${SITE}${code ? `?code=${encodeURIComponent(code)}` : ''}#/${id}${rest}`;
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   const usedBytes = () => (state.project?.sections || []).reduce((n, s) => n + s.images.reduce((m, i) => m + (i.bytes || 0), 0), 0);
@@ -150,10 +156,10 @@
   }
 
   /* -------------------------------------------------------------------- api */
-  async function api(method, path, body, { space = spaceId() } = {}) {
-    const headers = {};
+  async function api(method, path, body, { space = spaceId(), headers: extra = {} } = {}) {
+    const headers = { ...extra };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    if (state.siteKey) headers['X-Admin-Key'] = state.siteKey;
+    if (state.siteSession) headers['X-Admin-Session'] = state.siteSession;
     if (space) {
       const c = creds.get(space);
       if (c.key) headers['X-Space-Key'] = c.key;
@@ -172,6 +178,40 @@
       throw err;
     }
     return data;
+  }
+
+  // Cloudflare Turnstile, only when the Worker turns it on (config.turnstileSiteKey).
+  // Resolves to a token for X-Turnstile-Token, or to nothing when it's off.
+  let turnstileScript = null;
+  async function humanCheck() {
+    if (!state.config) state.config = await api('GET', '/api/config', undefined, { space: null }).catch(() => null);
+    const sitekey = state.config?.turnstileSiteKey;
+    if (!sitekey) return {};
+    turnstileScript ||= new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      el.async = true;
+      el.onload = () => resolve(window.turnstile);
+      el.onerror = () => { turnstileScript = null; reject(new Error('Could not load the “are you human” check. Check your connection and try again.')); };
+      document.head.append(el);
+    });
+    const ts = await turnstileScript;
+    const box = document.createElement('div');
+    box.className = 'turnstile';
+    document.body.append(box);
+    let widget;
+    try {
+      const token = await new Promise((resolve, reject) => {
+        widget = ts.render(box, {
+          sitekey, appearance: 'interaction-only', callback: resolve,
+          'error-callback': () => reject(new Error('The “are you human” check failed. Please try again.')),
+        });
+      });
+      return { 'X-Turnstile-Token': token };
+    } finally {
+      if (widget !== undefined) ts.remove(widget);
+      box.remove();
+    }
   }
 
   // Mutations return the updated section; patch it into local state.
@@ -467,6 +507,7 @@
   async function load({ quiet = false } = {}) {
     const id = spaceId();
     try {
+      if (state.me && imageTokenExpiring()) state.me = await api('GET', `/api/s/${id}/me`);
       state.project = await api('GET', `/api/s/${id}/project`);
       state.lastLoad = Date.now();
       document.title = `${state.project.title} · Review Desk`;
@@ -485,7 +526,7 @@
         <p>${asOwner ? 'Paste the space key you received when the space was created.' : 'You should have received it with the link to this page.'}${demo && info.expiresAt ? ` This demo space ends in ${timeLeft(info.expiresAt)}.` : ''}</p>
         <div class="field">
           <label for="gate-value">${asOwner ? 'Space key' : 'Review code'}</label>
-          <input class="input ${asOwner ? 'mono' : 'code-input'}" id="gate-value" ${asOwner ? 'type="password" placeholder="sk-…"' : 'placeholder="ABCD-EFGH" autocapitalize="characters"'} autocomplete="off" spellcheck="false" required>
+          <input class="input ${asOwner ? 'mono' : 'code-input'}" id="gate-value" ${asOwner ? 'type="password" placeholder="sk-…"' : 'placeholder="ABCD-EFGH-JKMN" autocapitalize="characters"'} autocomplete="off" spellcheck="false" required>
         </div>
         ${message ? `<div class="err">${esc(message)}</div>` : ''}
         <div class="row">
@@ -782,12 +823,16 @@
   /* ------------------------------------------------------------- site admin */
   async function openAdmin() {
     document.title = 'Site admin · Review Desk';
-    if (!state.siteKey) return adminGate();
+    if (!state.siteSession || sessionExpiry(state.siteSession) <= Date.now()) {
+      const expired = !!state.siteSession;
+      adminSignOut();
+      return adminGate(expired ? 'Your admin session ended. Please sign in again.' : '');
+    }
     loading();
     try {
       state.overview = await api('GET', '/api/admin/overview', undefined, { space: null });
     } catch (e) {
-      if (e.status === 403) { state.siteKey = ''; session.set('siteKey', null); return adminGate('That key is not correct.'); }
+      if (e.status === 403) { adminSignOut(); return adminGate('Your admin session ended. Please sign in again.'); }
       return notice({ title: 'Can’t load the admin console', text: esc(e.message), actions: '<button class="btn" data-action="reload">Try again</button>' });
     }
     state.usage = {};
@@ -795,23 +840,41 @@
     loadUsage();
   }
 
-  function adminGate(message = '') {
+  function adminSignOut() {
+    state.siteSession = '';
+    session.set('siteSession', null);
+  }
+
+  // The admin key is sent once and exchanged for a one-hour session; only the session is kept.
+  async function adminGate(message = '') {
+    if (!state.config) state.config = await api('GET', '/api/config', undefined, { space: null }).catch(() => null);
+    const otp = !!state.config?.adminOtp;
     page(`
       <form class="card-form" id="admin-form" novalidate>
         <h1>Site admin</h1>
-        <p>Approve space requests and manage every space. Enter the <code>ADMIN_KEY</code> set on the Worker.</p>
+        <p>Approve space requests and manage every space. Enter the <code>ADMIN_KEY</code> set on the Worker${otp ? ' and the code from your authenticator app' : ''}. You stay signed in for an hour, in this tab only.</p>
         <div class="field"><label for="admin-key">Admin key</label><input class="input mono" id="admin-key" type="password" autocomplete="current-password" required></div>
-        ${message ? `<div class="err">${esc(message)}</div>` : ''}
+        ${otp ? '<div class="field"><label for="admin-otp">Authenticator code</label><input class="input mono" id="admin-otp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div>' : ''}
+        <div class="err" id="admin-err" ${message ? '' : 'hidden'}>${esc(message)}</div>
         <div class="row"><a class="btn ghost" href="#/">Cancel</a><button class="btn primary" type="submit">Sign in</button></div>
       </form>`);
     $('#admin-key').focus();
-    $('#admin-form').onsubmit = (e) => {
+    $('#admin-form').onsubmit = async (e) => {
       e.preventDefault();
       const key = $('#admin-key').value.trim();
       if (!key) return;
-      state.siteKey = key;
-      session.set('siteKey', key);
-      openAdmin();
+      const btn = e.target.querySelector('[type=submit]');
+      btn.disabled = true;
+      try {
+        const r = await api('POST', '/api/admin/session', { key, otp: $('#admin-otp')?.value.trim() || undefined }, { space: null });
+        state.siteSession = r.session;
+        session.set('siteSession', r.session);
+        openAdmin();
+      } catch (err) {
+        $('#admin-err').hidden = false;
+        $('#admin-err').textContent = err.message;
+        btn.disabled = false;
+      }
     };
   }
 
@@ -1004,7 +1067,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
 
     // home
     'start-demo': () => run(async () => {
-      const d = await api('POST', '/api/demo', undefined, { space: null });
+      const d = await api('POST', '/api/demo', undefined, { space: null, headers: await humanCheck() });
       creds.set(d.spaceId, { key: d.adminKey, code: d.reviewCode, title: d.space.title, kind: 'demo', expiresAt: d.space.expiresAt });
       store.set('demo', d.spaceId);
       state.welcome = d.spaceId;
@@ -1021,7 +1084,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       ],
       confirm: 'Send request',
       onSubmit: async (v) => {
-        const r = await api('POST', '/api/requests', v, { space: null });
+        const r = await api('POST', '/api/requests', v, { space: null, headers: await humanCheck() });
         saveRequests([...myRequests(), { id: r.id, token: r.token, createdAt: new Date().toISOString(), lastStatus: 'pending' }]);
         nav(`#/r/${r.id}`);
       },
@@ -1055,6 +1118,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     'rotate-code': () => confirmBox('Create a new review code?', 'Everyone using the current link or code loses access until you send them the new one.', 'New code', async () => {
       const r = await api('POST', `/api/s/${spaceId()}/rotate-code`);
       state.me.reviewCode = r.reviewCode;
+      state.me.imageToken = r.imageToken;
       if (creds.get(spaceId()).key) creds.set(spaceId(), { code: r.reviewCode });
       state.menuOpen = false;
       render();
@@ -1173,7 +1237,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     // site admin
     'admin-tab': (el) => { state.adminTab = el.dataset.tab; render(); },
     'admin-refresh': () => openAdmin(),
-    'admin-out': () => { state.siteKey = ''; session.set('siteKey', null); nav('#/'); },
+    'admin-out': () => { adminSignOut(); nav('#/'); },
     'approve': (el) => {
       const r = findReq(el.dataset.id);
       modal({

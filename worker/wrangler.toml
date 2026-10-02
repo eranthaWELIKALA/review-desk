@@ -29,8 +29,32 @@ DEMO_PER_IP_PER_DAY = "3"
 SPACE_QUOTA_MB = "200"
 MAX_PENDING_REQUESTS = "50"
 
+# Turnstile ("are you human" check) on demo and space requests. Optional: set the
+# site key here and TURNSTILE_SECRET as a secret to turn it on.
+# TURNSTILE_SITE_KEY = "0x4AAAA..."
+
+# Per-IP rate limits (per Cloudflare location, approximate). Without these bindings
+# the Worker falls back to an in-memory counter per isolate (RATE_AUTH_PER_MIN /
+# RATE_WRITES_PER_MIN vars, defaults 20 and 30).
+[[ratelimits]]
+name = "AUTH_LIMIT"           # credential checks that aren't already known good
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 20
+  period = 60
+
+[[ratelimits]]
+name = "WRITE_LIMIT"          # every POST/PATCH/DELETE (each is a GitHub commit)
+namespace_id = "1002"
+  [ratelimits.simple]
+  limit = 30
+  period = 60
+
 # Secrets — set with `npx wrangler secret put <NAME>`, never commit them:
-#   GITHUB_TOKEN  fine-grained token, data repo only, Contents: Read and write
-#   ADMIN_KEY     long random string; the site admin console (#/admin)
-#   SPACE_SECRET  long random string; space keys and review codes are derived from it.
-#                 Changing it invalidates every space key and review code at once.
+#   GITHUB_TOKEN       fine-grained token, data repo only, Contents: Read and write
+#   ADMIN_KEY          long random string (32+ chars); exchanged for a 1-hour admin session
+#   SPACE_SECRET       long random string; space keys, review codes, image tokens and the
+#                      IP salt are derived from it. Changing it invalidates them all at once.
+#   ADMIN_TOTP_SECRET  optional, base32; when set, admin sign-in also needs an
+#                      authenticator-app code (recommended)
+#   TURNSTILE_SECRET   optional; see TURNSTILE_SITE_KEY above

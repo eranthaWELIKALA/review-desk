@@ -16,16 +16,28 @@
  *     registry/demos.json               demos started in the last day (for rate limits)
  *
  * Who can do what:
- *   site admin    X-Admin-Key: ADMIN_KEY          approve requests, manage every space
- *   space admin   X-Space-Key: sk-<id>-<mac>      upload, edit, resolve in one space
- *   reviewer      X-Review-Code: per-space code   view and comment in one space
+ *   site admin    X-Admin-Session: as.<exp>.<mac>  approve requests, manage every space
+ *                 (from POST /api/admin/session with ADMIN_KEY, plus a TOTP code
+ *                 when ADMIN_TOTP_SECRET is set; valid for one hour)
+ *   space admin   X-Space-Key: sk-<id>-<mac>       upload, edit, resolve in one space
+ *   reviewer      X-Review-Code: per-space code    view and comment in one space
+ *   images        /img/…?t=<exp>.<mac>             short-lived token from /me, so the
+ *                                                  review code never goes in a URL
  * Space keys and review codes are HMACs of the space id under SPACE_SECRET, so no
  * secret is written to the repo. Bumping keyVersion / codeVersion rotates them.
+ * Admin sessions, image tokens and the IP salt use their own keys derived from
+ * SPACE_SECRET with HKDF.
  *
- * Secrets:  GITHUB_TOKEN, ADMIN_KEY, SPACE_SECRET
+ * Abuse controls: wrong credentials and writes are rate limited per IP (the
+ * AUTH_LIMIT and WRITE_LIMIT bindings, or an in-memory fallback), and demo and
+ * request creation need a Turnstile token when TURNSTILE_SECRET is set.
+ *
+ * Secrets:  GITHUB_TOKEN, ADMIN_KEY, SPACE_SECRET, ADMIN_TOTP_SECRET (optional),
+ *           TURNSTILE_SECRET (optional)
  * Vars:     GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH, DEMO_BRANCH, ALLOWED_ORIGINS,
  *           DEMO_ENABLED, DEMO_QUOTA_MB, DEMO_HOURS, DEMO_MAX_ACTIVE, DEMO_PER_IP_PER_DAY,
- *           SPACE_QUOTA_MB, MAX_PENDING_REQUESTS
+ *           SPACE_QUOTA_MB, MAX_PENDING_REQUESTS, TURNSTILE_SITE_KEY,
+ *           RATE_AUTH_PER_MIN, RATE_WRITES_PER_MIN (in-memory fallback only)
  */
 
 const MB = 1024 * 1024;
@@ -44,6 +56,18 @@ const ID_RE = /^[a-z0-9]{6,40}$/;
 const SPACE_RE = /^[sd][a-z0-9]{10,30}$/;          // s… = approved space, d… = demo
 const IMAGE_REL_RE = /^[a-z0-9]{6,40}\/[a-z0-9]{6,40}-[a-z0-9-]{1,50}\.(png|jpg|gif|webp)$/;
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L
+// Review code scheme 2: 12 characters (~59 bits) without modulo bias. Spaces
+// created before it keep their 8-character code until it is rotated.
+const CODE_SCHEME = 2;
+const ADMIN_SESSION_MS = 60 * 60e3;
+const IMAGE_TOKEN_STEP_MS = 12 * 3600e3; // tokens last 12–24 h and stay stable for 12 h, so images cache
+// Magic bytes for each upload type, so a file can't pretend to be an image.
+const IMAGE_MAGIC = {
+  png: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a,
+  jpg: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,
+  gif: (b) => String.fromCharCode(...b.slice(0, 6)) === 'GIF87a' || String.fromCharCode(...b.slice(0, 6)) === 'GIF89a',
+  webp: (b) => String.fromCharCode(...b.slice(0, 4)) === 'RIFF' && String.fromCharCode(...b.slice(8, 12)) === 'WEBP',
+};
 const SPACES_REG = 'registry/spaces.json';
 const REQUESTS_REG = 'registry/requests.json';
 const DEMOS_REG = 'registry/demos.json';
@@ -52,21 +76,35 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// Sent on every response. The API only returns JSON and images, so nothing may frame or run it.
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+};
+
 export default {
   async fetch(request, env) {
+    const requestId = crypto.randomUUID();
     const cors = corsHeaders(env, request.headers.get('Origin'));
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors, ...SECURITY_HEADERS } });
 
     let res;
     try {
       res = await route(request, env);
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 500;
-      if (!(err instanceof HttpError)) console.error(err);
-      res = json({ error: err instanceof HttpError ? err.message : `Server error: ${err.message}` }, status);
+      // 500s and storage errors can carry config or GitHub details: log them, and
+      // show the client only a reference it can quote.
+      const internal = status === 500 || status === 502;
+      if (internal) console.error(JSON.stringify({ requestId, method: request.method, path: new URL(request.url).pathname, status, error: String(err?.message || err), stack: err?.stack }));
+      res = json({ error: internal ? `Something went wrong on our side. Reference: ${requestId}` : err.message, requestId }, status);
+      if (status === 429) res.headers.set('Retry-After', '60');
     }
     const headers = new Headers(res.headers);
-    for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+    for (const [k, v] of Object.entries({ ...cors, ...SECURITY_HEADERS })) headers.set(k, v);
+    headers.set('X-Request-Id', requestId);
     return new Response(res.body, { status: res.status, headers });
   },
 
@@ -87,26 +125,31 @@ async function route(request, env) {
 
   if (parts[0] === 'img' && method === 'GET') {
     const [, id, ...rest] = parts;
-    const ctx = await access(request, url, env, id);
-    if (!ctx.reviewer) throw new HttpError(401, 'Review code required');
-    return serveImage(env, ctx.sp, rest.join('/'));
+    const { sp, idx } = await spaceFor(env, id);
+    if (!(await validImageToken(env, idx, url.searchParams.get('t')))) throw new HttpError(401, 'Image link expired. Reload the page.');
+    return serveImage(env, sp, rest.join('/'));
   }
   if (parts[0] !== 'api') throw new HttpError(404, 'Not found');
   const [, a, ...rest] = parts;
+  if (method !== 'GET') await limitWrites(env, request);
 
   if (a === 'config' && method === 'GET') return json(publicConfig(env));
-  if (a === 'demo' && method === 'POST') return json(await createDemo(env, request), 201);
+  if (a === 'demo' && method === 'POST') {
+    await verifyTurnstile(env, request);
+    return json(await createDemo(env, request), 201);
+  }
   if (a === 'requests') return requestRoutes(request, env, rest, method);
   if (a === 'admin') {
-    if (!isSiteAdmin(request, env)) throw new HttpError(403, 'Site admin key required');
+    if (rest[0] === 'session' && rest.length === 1 && method === 'POST') return json(await adminSignIn(env, request), 201);
+    if (!(await isSiteAdmin(request, env))) throw new HttpError(403, 'Site admin sign-in required');
     return adminRoutes(request, env, rest, method);
   }
-  if (a === 's' && rest[0]) return spaceRoutes(request, env, url, rest[0], rest.slice(1), method);
+  if (a === 's' && rest[0]) return spaceRoutes(request, env, rest[0], rest.slice(1), method);
   throw new HttpError(404, 'Not found');
 }
 
-async function spaceRoutes(request, env, url, id, p, method) {
-  const ctx = await access(request, url, env, id);
+async function spaceRoutes(request, env, id, p, method) {
+  const ctx = await access(request, env, id);
   const { sp } = ctx;
   const [a, b, c, d, e] = p;
 
@@ -116,8 +159,9 @@ async function spaceRoutes(request, env, url, id, p, method) {
       siteAdmin: ctx.site,
       authorized: ctx.reviewer,
       space: ctx.reviewer ? publicSpace(ctx.idx) : { id, kind: ctx.idx.kind, expiresAt: ctx.idx.expiresAt || null },
-      // Admins need the code to build share links and image URLs.
-      reviewCode: ctx.admin ? formatCode(await reviewCode(env, id, ctx.idx.codeVersion)) : null,
+      // Admins need the code to build share links.
+      reviewCode: ctx.admin ? formatCode(await reviewCode(env, id, ctx.idx)) : null,
+      imageToken: ctx.reviewer ? await imageToken(env, ctx.idx) : null,
     });
   }
 
@@ -148,10 +192,11 @@ async function spaceRoutes(request, env, url, id, p, method) {
     const idx = await updateJson(env, sp.br, indexPath(sp), (x) => {
       must(x, 'Space');
       x.codeVersion = (x.codeVersion || 1) + 1;
+      x.codeScheme = CODE_SCHEME; // upgrades older spaces to the longer code
       return x;
     }, 'review: new review code');
     authCache.delete(id);
-    return json({ reviewCode: formatCode(await reviewCode(env, id, idx.codeVersion)) });
+    return json({ reviewCode: formatCode(await reviewCode(env, id, idx)), imageToken: await imageToken(env, idx) });
   }
 
   if (a === 'sections') {
@@ -178,7 +223,10 @@ async function spaceRoutes(request, env, url, id, p, method) {
 
 async function requestRoutes(request, env, p, method) {
   const [id, action] = p;
-  if (!id && method === 'POST') return json(await createRequest(env, request), 201);
+  if (!id && method === 'POST') {
+    await verifyTurnstile(env, request);
+    return json(await createRequest(env, request), 201);
+  }
   if (id && action === 'status' && method === 'POST') return json(await requestStatus(env, id, await readBody(request)));
   throw new HttpError(404, 'Not found');
 }
@@ -250,7 +298,12 @@ function settings(env) {
 
 function publicConfig(env) {
   const s = settings(env);
-  return { demo: { enabled: s.demoEnabled, quotaBytes: s.demoQuota, hours: s.demoHours }, spaceQuotaBytes: s.spaceQuota };
+  return {
+    demo: { enabled: s.demoEnabled, quotaBytes: s.demoQuota, hours: s.demoHours },
+    spaceQuotaBytes: s.spaceQuota,
+    turnstileSiteKey: env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY ? env.TURNSTILE_SITE_KEY : null,
+    adminOtp: !!env.ADMIN_TOTP_SECRET,
+  };
 }
 
 // Space settings used for auth, cached briefly per isolate to save a GitHub read
@@ -264,58 +317,248 @@ async function spaceForAuth(env, id) {
   return idx;
 }
 
-async function access(request, url, env, id) {
+async function spaceFor(env, id) {
   if (!SPACE_RE.test(String(id || ''))) throw new HttpError(404, 'Space not found');
   if (isDemoId(id) && Date.now() - idTime(id) > settings(env).demoHours * 3600e3) {
     throw new HttpError(410, 'This demo space has expired and its files have been deleted.');
   }
   const idx = await spaceForAuth(env, id);
   if (!idx) throw new HttpError(404, 'Space not found');
+  return { sp: space(env, id), idx };
+}
 
-  const site = isSiteAdmin(request, env);
+async function access(request, env, id) {
+  const { sp, idx } = await spaceFor(env, id);
+  const site = await isSiteAdmin(request, env);
   const key = request.headers.get('X-Space-Key');
-  const admin = site || (!!key && safeEqual(key, await spaceKey(env, id, idx.keyVersion)));
-  const code = normCode(request.headers.get('X-Review-Code') || url.searchParams.get('code'));
-  const reviewer = admin || (!!code && safeEqual(code, await reviewCode(env, id, idx.codeVersion)));
-  return { sp: space(env, id), idx, site, admin, reviewer };
+  const admin = site || (!!key && await checkCredential(env, request, `${id}:k`, key, () => spaceKey(env, id, idx.keyVersion)));
+  const code = normCode(request.headers.get('X-Review-Code'));
+  const reviewer = admin || (!!code && await checkCredential(env, request, `${id}:c`, code, () => reviewCode(env, id, idx)));
+  return { sp, idx, site, admin, reviewer };
+}
+
+/**
+ * Compares a presented credential with the real one. A credential this isolate
+ * has already seen succeed is free; any other attempt costs one AUTH_LIMIT unit
+ * before it is checked, so once an IP runs out every guess is refused, right or
+ * wrong, and guessing can't go faster than the limit.
+ */
+const goodCredentials = new Map(); // `${scope}:${credential}` -> expiry; in memory only
+async function checkCredential(env, request, scope, given, expected) {
+  const cacheKey = `${scope}:${given}`;
+  const want = await expected();
+  if ((goodCredentials.get(cacheKey) || 0) > Date.now()) return safeEqual(given, want);
+  if (!(await allow(env, 'AUTH_LIMIT', await ipHash(env, request), env.RATE_AUTH_PER_MIN, 20))) {
+    throw new HttpError(429, 'Too many attempts. Please wait a minute and try again.');
+  }
+  const ok = safeEqual(given, want);
+  if (ok) {
+    if (goodCredentials.size > 5000) goodCredentials.clear();
+    goodCredentials.set(cacheKey, Date.now() + 10 * 60e3);
+  }
+  return ok;
+}
+
+/* ------------------------------------------------------------- abuse control */
+
+/**
+ * One unit from a per-IP limiter. Uses the Workers rate-limit binding `name` when
+ * it is configured (see wrangler.toml), otherwise a fixed one-minute window kept
+ * in this isolate's memory (dev, tests, or a plan without the binding).
+ */
+const memoryLimits = new WeakMap(); // env -> Map(key -> { start, n })
+async function allow(env, name, key, perMin, fallback) {
+  if (env[name]?.limit) return (await env[name].limit({ key })).success;
+  if (!memoryLimits.has(env)) memoryLimits.set(env, new Map());
+  const m = memoryLimits.get(env);
+  const t = Date.now();
+  const k = `${name}:${key}`;
+  let w = m.get(k);
+  if (!w || t - w.start >= 60_000) { w = { start: t, n: 0 }; m.set(k, w); }
+  if (m.size > 10_000) for (const [mk, mw] of m) if (t - mw.start >= 60_000) m.delete(mk);
+  return ++w.n <= (Number(perMin) > 0 ? Number(perMin) : fallback);
+}
+
+// Every write is at least one GitHub commit, and the token's hourly budget is
+// shared by every space, so one visitor must not be able to spend it all.
+async function limitWrites(env, request) {
+  if (!(await allow(env, 'WRITE_LIMIT', await ipHash(env, request), env.RATE_WRITES_PER_MIN, 30))) {
+    throw new HttpError(429, 'You’re saving very quickly. Please wait a minute and try again.');
+  }
+}
+
+/** When TURNSTILE_SECRET is set, demo and request creation need a solved challenge. */
+async function verifyTurnstile(env, request) {
+  if (!env.TURNSTILE_SECRET) return;
+  const token = request.headers.get('X-Turnstile-Token');
+  if (!token || token.length > 2048) throw new HttpError(403, 'Please complete the “are you human” check and try again.');
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('response', token);
+  const ip = request.headers.get('CF-Connecting-IP');
+  if (ip) form.append('remoteip', ip);
+  let out;
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
+    out = await res.json();
+  } catch (err) {
+    throw new HttpError(502, `Turnstile verification failed: ${err.message}`);
+  }
+  if (!out?.success) throw new HttpError(403, 'The “are you human” check failed. Please try again.');
 }
 
 /* -------------------------------------------------------------- credentials */
 
-async function hmac(env, msg) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(env.SPACE_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(msg)));
+const enc = new TextEncoder();
+async function hmacRaw(keyBytes, msg, hash = 'SHA-256') {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, typeof msg === 'string' ? enc.encode(msg) : msg));
+}
+// Space keys and review codes: HMAC directly under SPACE_SECRET. Kept as is so
+// existing keys and codes keep working.
+const hmac = (env, msg) => hmacRaw(enc.encode(env.SPACE_SECRET), msg);
+
+// Everything newer gets its own key, derived from SPACE_SECRET with HKDF, so one
+// purpose can never produce a value that is valid for another.
+const subkeys = new Map(); // `${secret}|${purpose}` -> bytes, per isolate
+async function subkey(env, purpose) {
+  const id = `${env.SPACE_SECRET}|${purpose}`;
+  if (!subkeys.has(id)) {
+    const base = await crypto.subtle.importKey('raw', enc.encode(env.SPACE_SECRET), 'HKDF', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: enc.encode('review-desk/v1'), info: enc.encode(purpose) }, base, 256);
+    if (subkeys.size > 32) subkeys.clear();
+    subkeys.set(id, new Uint8Array(bits));
+  }
+  return subkeys.get(id);
 }
 const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 async function spaceKey(env, id, version = 1) {
   return `sk-${id}-${b64url(await hmac(env, `key:${id}:${version}`)).slice(0, 22)}`;
 }
-async function reviewCode(env, id, version = 1) {
-  const bytes = await hmac(env, `code:${id}:${version}`);
+async function reviewCode(env, id, idx) {
+  const version = idx.codeVersion || 1;
+  if ((idx.codeScheme || 1) < 2) {
+    // Scheme 1 (older spaces): 8 characters, slightly biased. Replaced on rotation.
+    const bytes = await hmac(env, `code:${id}:${version}`);
+    let out = '';
+    for (let i = 0; i < 8; i++) out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+    return out;
+  }
+  // Scheme 2: 12 characters, rejection-sampled so every character is equally likely.
+  const limit = 256 - (256 % CODE_ALPHABET.length);
   let out = '';
-  for (let i = 0; i < 8; i++) out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  for (let round = 0; out.length < 12; round++) {
+    for (const b of await hmac(env, `code2:${id}:${version}:${round}`)) {
+      if (b < limit) out += CODE_ALPHABET[b % CODE_ALPHABET.length];
+      if (out.length === 12) break;
+    }
+  }
   return out;
 }
-const normCode = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-const formatCode = (c) => `${c.slice(0, 4)}-${c.slice(4)}`;
+const normCode = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 32);
+const formatCode = (c) => c.match(/.{1,4}/g).join('-');
 
 async function keysFor(env, idx) {
   return {
     spaceId: idx.id,
     adminKey: await spaceKey(env, idx.id, idx.keyVersion),
-    reviewCode: formatCode(await reviewCode(env, idx.id, idx.codeVersion)),
+    reviewCode: formatCode(await reviewCode(env, idx.id, idx)),
   };
 }
 
+/**
+ * Image URLs carry a token instead of the review code: `<exp>.<mac>`, bound to
+ * the space and its current code version, so a new review code also cuts off
+ * old image links. The expiry is rounded up to a 12-hour step, which keeps the
+ * URL (and the browser cache) stable for at least 12 hours.
+ */
+async function imageToken(env, idx, t = Date.now()) {
+  const exp = (Math.floor(t / IMAGE_TOKEN_STEP_MS) + 2) * IMAGE_TOKEN_STEP_MS;
+  return `${exp.toString(36)}.${await imageMac(env, idx, exp)}`;
+}
+const imageMac = async (env, idx, exp) =>
+  b64url(await hmacRaw(await subkey(env, 'image-token'), `img:${idx.id}:${idx.codeVersion || 1}:${exp}`)).slice(0, 32);
+async function validImageToken(env, idx, token) {
+  const m = String(token || '').match(/^([a-z0-9]{1,12})\.([A-Za-z0-9_-]{32})$/);
+  if (!m) return false;
+  const exp = parseInt(m[1], 36);
+  if (!(exp > Date.now()) || exp - Date.now() > 2 * IMAGE_TOKEN_STEP_MS) return false;
+  return safeEqual(m[2], await imageMac(env, idx, exp));
+}
+
+/* ------------------------------------------------------------ site admin auth */
+
+/**
+ * The admin key is sent once, to POST /api/admin/session, and exchanged for a
+ * signed session that expires after an hour. Every attempt costs an AUTH_LIMIT
+ * unit, right or wrong. With ADMIN_TOTP_SECRET set, an authenticator code is
+ * required too.
+ */
+async function adminSignIn(env, request) {
+  if (!(await allow(env, 'AUTH_LIMIT', await ipHash(env, request), env.RATE_AUTH_PER_MIN, 20))) {
+    throw new HttpError(429, 'Too many attempts. Please wait a minute and try again.');
+  }
+  const body = await readBody(request);
+  const keyOk = safeEqual(String(body.key || ''), env.ADMIN_KEY);
+  const otpOk = !env.ADMIN_TOTP_SECRET || (await validTotp(env.ADMIN_TOTP_SECRET, String(body.otp || '')));
+  if (!keyOk || !otpOk) {
+    console.warn(JSON.stringify({ event: 'admin_sign_in_failed', ip: await ipHash(env, request), at: now() }));
+    throw new HttpError(403, env.ADMIN_TOTP_SECRET ? 'That key or authenticator code is not correct.' : 'That key is not correct.');
+  }
+  console.log(JSON.stringify({ event: 'admin_sign_in', ip: await ipHash(env, request), at: now() }));
+  const exp = Date.now() + ADMIN_SESSION_MS;
+  return { session: `as.${exp.toString(36)}.${await adminMac(env, exp)}`, expiresAt: new Date(exp).toISOString() };
+}
+
+// Bound to ADMIN_KEY too, so changing the key signs every admin out.
+const adminMac = async (env, exp) =>
+  b64url(await hmacRaw(await subkey(env, 'admin-session'), `admin:${exp}:${await sha256hex(env.ADMIN_KEY)}`)).slice(0, 32);
+
+async function isSiteAdmin(request, env) {
+  const m = String(request.headers.get('X-Admin-Session') || '').match(/^as\.([a-z0-9]{1,12})\.([A-Za-z0-9_-]{32})$/);
+  if (!m) return false;
+  const exp = parseInt(m[1], 36);
+  if (!(exp > Date.now()) || exp - Date.now() > ADMIN_SESSION_MS) return false;
+  return safeEqual(m[2], await adminMac(env, exp));
+}
+
+/** RFC 6238 TOTP (SHA-1, 6 digits, 30 s), accepting one step of clock drift either way. */
+async function validTotp(secretB32, code) {
+  if (!/^\d{6}$/.test(code)) return false;
+  const key = base32Decode(secretB32);
+  const step = Math.floor(Date.now() / 30_000);
+  let ok = false;
+  for (const s of [step - 1, step, step + 1]) {
+    const msg = new Uint8Array(8);
+    new DataView(msg.buffer).setBigUint64(0, BigInt(s));
+    const h = await hmacRaw(key, msg, 'SHA-1');
+    const o = h[h.length - 1] & 0xf;
+    const n = (((h[o] & 0x7f) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 1e6;
+    ok = safeEqual(String(n).padStart(6, '0'), code) || ok; // check every step: no timing hint
+  }
+  return ok;
+}
+function base32Decode(s) {
+  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = String(s).toUpperCase().replace(/[^A-Z2-7]/g, '');
+  const out = [];
+  let bits = 0, val = 0;
+  for (const ch of clean) {
+    val = (val << 5) | alpha.indexOf(ch);
+    bits += 5;
+    if (bits >= 8) { out.push((val >>> (bits - 8)) & 0xff); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+
 async function sha256hex(s) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(s));
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
 }
-// Salted, truncated hash: enough to rate-limit, not enough to recover the address.
+// Keyed, truncated hash: enough to rate-limit, not enough to recover the address.
 const ipHash = async (env, request) =>
-  (await sha256hex(`${env.SPACE_SECRET}:ip:${request.headers.get('CF-Connecting-IP') || 'unknown'}`)).slice(0, 16);
+  b64url(await hmacRaw(await subkey(env, 'ip-hash'), `ip:${request.headers.get('CF-Connecting-IP') || 'unknown'}`)).slice(0, 16);
 const randomToken = () => b64url(crypto.getRandomValues(new Uint8Array(24)));
 
 /* ------------------------------------------------------------------- spaces */
@@ -332,9 +575,9 @@ async function createSpace(env, id, { kind, title, quotaBytes, expiresAt }) {
   const sp = space(env, id);
   const idx = {
     id, kind, title, sections: [], quotaBytes, usedBytes: 0,
-    keyVersion: 1, codeVersion: 1, createdAt: now(), ...(expiresAt ? { expiresAt } : {}),
+    keyVersion: 1, codeVersion: 1, codeScheme: CODE_SCHEME, createdAt: now(), ...(expiresAt ? { expiresAt } : {}),
   };
-  await putFile(env, sp.br, indexPath(sp), b64encodeUtf8(pretty(idx)), `${kind === 'demo' ? 'demo' : 'admin'}: create space "${title}"`);
+  await putFile(env, sp.br, indexPath(sp), b64encodeUtf8(pretty(idx)), `${kind === 'demo' ? 'demo' : 'admin'}: create space "${forCommit(title)}"`);
   return { space: publicSpace(idx), ...(await keysFor(env, idx)) };
 }
 
@@ -425,7 +668,7 @@ async function createRequest(env, request) {
   const email = cleanText(body.email, 200, 'Email');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new HttpError(400, 'Please enter a valid email address');
   const organization = cleanText(body.organization || '', 120, 'Organization', true);
-  const purpose = cleanText(body.purpose, 1000, 'Purpose');
+  const purpose = cleanText(body.purpose, 1000, 'Purpose', false, true);
   const who = await ipHash(env, request);
   const token = randomToken();
   const tokenHash = await sha256hex(token);
@@ -508,7 +751,7 @@ async function approveRequest(env, id, body) {
 }
 
 async function rejectRequest(env, id, body) {
-  const reason = cleanText(body.reason || '', 500, 'Reason', true);
+  const reason = cleanText(body.reason || '', 500, 'Reason', true, true);
   await updateJson(env, dataBranch(env), REQUESTS_REG, (reg) => {
     const r = must(reg?.requests.find((x) => x.id === id), 'Request');
     if (r.status !== 'pending') throw new HttpError(409, `This request was already ${r.status}`);
@@ -597,7 +840,7 @@ async function createSection(env, sp, body) {
   const section = {
     id: newId(),
     title: cleanText(body.title, 120, 'Title'),
-    description: cleanText(body.description || '', 1000, 'Description', true),
+    description: cleanText(body.description || '', 1000, 'Description', true, true),
     createdAt: now(),
     images: [],
     comments: [],
@@ -607,8 +850,8 @@ async function createSection(env, sp, body) {
     if (idx.sections.length >= MAX_SECTIONS) throw new HttpError(400, `A space can have up to ${MAX_SECTIONS} sections`);
     idx.sections.push(section.id);
     return idx;
-  }, `review: list section "${section.title}"`);
-  await putFile(env, sp.br, sectionPath(sp, section.id), b64encodeUtf8(pretty(section)), `review: add section "${section.title}"`);
+  }, `review: list section "${forCommit(section.title)}"`);
+  await putFile(env, sp.br, sectionPath(sp, section.id), b64encodeUtf8(pretty(section)), `review: add section "${forCommit(section.title)}"`);
   return section;
 }
 
@@ -616,7 +859,7 @@ async function updateSection(env, sp, id, body) {
   return updateJson(env, sp.br, sectionPath(sp, id), (s) => {
     must(s, 'Section');
     if (body.title !== undefined) s.title = cleanText(body.title, 120, 'Title');
-    if (body.description !== undefined) s.description = cleanText(body.description, 1000, 'Description', true);
+    if (body.description !== undefined) s.description = cleanText(body.description, 1000, 'Description', true, true);
     return s;
   }, 'review: edit section');
 }
@@ -630,14 +873,14 @@ async function deleteSection(env, sp, sid) {
     idx.sections = idx.sections.filter((s) => s !== sid);
     if (section) idx.usedBytes = Math.max(0, (idx.usedBytes || 0) - sumBytes(section));
     return idx;
-  }, `review: delete section "${section?.title || sid}"`);
+  }, `review: delete section "${forCommit(section?.title || sid)}"`);
   // One commit for the section file and all its screenshots.
   const file = sectionPath(sp, sid);
   const dir = `${sp.base}/images/${sid}/`;
   await rewriteBranch(env, sp.br, (blobs) => {
     const drop = blobs.filter((b) => b.path === file || b.path.startsWith(dir)).map((b) => b.path);
     return drop.length ? { drop } : null;
-  }, { message: `review: delete files of section "${section?.title || sid}"` });
+  }, { message: `review: delete files of section "${forCommit(section?.title || sid)}"` });
 }
 
 /** Adds `delta` bytes to the space's usage, refusing to go over its quota. */
@@ -654,13 +897,16 @@ async function reserve(env, sp, delta) {
 }
 
 async function uploadImage(env, sp, sectionId, body) {
-  const filename = String(body.filename || 'screenshot.png');
+  const filename = cleanText(body.filename || 'screenshot.png', 200, 'File name');
   const ext = (filename.match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase();
   if (!IMAGE_TYPES[ext]) throw new HttpError(400, 'Only PNG, JPG, GIF and WebP images are supported');
   const data = String(body.data || '').replace(/^data:[^,]*,/, '').replace(/\s/g, '');
-  if (!data || !/^[A-Za-z0-9+/]+=*$/.test(data)) throw new HttpError(400, 'Image data missing or not base64');
+  if (!data || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new HttpError(400, 'Image data missing or not base64');
   const bytes = Math.floor(data.length * 3 / 4) - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0);
   if (bytes > MAX_IMAGE_BYTES) throw new HttpError(413, 'Image is larger than 15 MB');
+  // The extension is only a claim: check the file really starts like that format.
+  const head = Uint8Array.from(atob(data.slice(0, 16)), (c) => c.charCodeAt(0));
+  if (!IMAGE_MAGIC[ext === 'jpeg' ? 'jpg' : ext](head)) throw new HttpError(400, `This file isn’t a valid ${ext.toUpperCase()} image`);
 
   const section = must(await readJson(env, sp.br, sectionPath(sp, sectionId)), 'Section');
   if (section.images.length >= MAX_IMAGES_PER_SECTION) throw new HttpError(400, `A section can have up to ${MAX_IMAGES_PER_SECTION} screenshots`);
@@ -670,7 +916,7 @@ async function uploadImage(env, sp, sectionId, body) {
   const slug = filename.replace(/\.[^.]+$/, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'screenshot';
   const rel = `${sectionId}/${id}-${slug}.${ext === 'jpeg' ? 'jpg' : ext}`;
   try {
-    await putFile(env, sp.br, imagePath(sp, rel), data, `review: upload ${filename} to "${section.title}"`);
+    await putFile(env, sp.br, imagePath(sp, rel), data, `review: upload ${rel.split('/').pop()} to "${forCommit(section.title)}"`);
   } catch (err) {
     await reserve(env, sp, -bytes).catch(() => {});
     throw err;
@@ -680,12 +926,12 @@ async function uploadImage(env, sp, sectionId, body) {
       must(s, 'Section');
       s.images.push({
         id, path: rel, bytes,
-        name: filename.slice(0, 200),
-        caption: cleanText(body.caption || '', 200, 'Caption', true),
+        name: filename,
+        caption: cleanText(body.caption || '', 200, 'Caption', true, true),
         uploadedAt: now(),
       });
       return s;
-    }, `review: add screenshot to "${section.title}"`);
+    }, `review: add screenshot to "${forCommit(section.title)}"`);
   } catch (err) {
     await deleteFileIfExists(env, sp.br, imagePath(sp, rel), 'review: undo upload').catch(() => {});
     await reserve(env, sp, -bytes).catch(() => {});
@@ -697,7 +943,7 @@ async function updateImage(env, sp, sectionId, imageId, body) {
   return updateJson(env, sp.br, sectionPath(sp, sectionId), (s) => {
     must(s, 'Section');
     const img = must(s.images.find((i) => i.id === imageId), 'Screenshot');
-    if (body.caption !== undefined) img.caption = cleanText(body.caption, 200, 'Caption', true);
+    if (body.caption !== undefined) img.caption = cleanText(body.caption, 200, 'Caption', true, true);
     return s;
   }, 'review: edit caption');
 }
@@ -711,14 +957,14 @@ async function deleteImage(env, sp, sectionId, imageId) {
     s.comments = s.comments.filter((c) => c.target !== imageId);
     return s;
   }, 'review: remove screenshot');
-  await deleteFileIfExists(env, sp.br, imagePath(sp, removed.path), `review: delete ${removed.name}`);
+  await deleteFileIfExists(env, sp.br, imagePath(sp, removed.path), `review: delete ${forCommit(removed.name)}`);
   if (removed.bytes) await reserve(env, sp, -removed.bytes);
   return section;
 }
 
 async function addComment(env, sp, sectionId, body) {
   const author = cleanText(body.author, MAX_NAME, 'Name');
-  const text = cleanText(body.text, MAX_COMMENT, 'Comment');
+  const text = cleanText(body.text, MAX_COMMENT, 'Comment', false, true);
   const parentId = body.parentId ? String(body.parentId) : null;
 
   return updateJson(env, sp.br, sectionPath(sp, sectionId), (s) => {
@@ -739,7 +985,7 @@ async function addComment(env, sp, sectionId, body) {
     }
     s.comments.push({ id: newId(), target, parentId, author, text, pin, createdAt: now(), resolved: false });
     return s;
-  }, `review: comment by ${author}`);
+  }, `review: comment by ${forCommit(author)}`);
 }
 
 async function updateComment(env, sp, sectionId, commentId, body) {
@@ -965,13 +1211,17 @@ function checkEnv(env) {
   if (missing.length) throw new HttpError(500, `Worker not configured: missing ${missing.join(', ')}`);
 }
 
+// Only origins listed in ALLOWED_ORIGINS get CORS headers; unset means no browser
+// origin is allowed. '*' is for local development only.
 function corsHeaders(env, origin) {
-  const allowed = String(env.ALLOWED_ORIGINS || '*').split(',').map((s) => s.trim()).filter(Boolean);
-  const allow = allowed.includes('*') ? '*' : (allowed.includes(origin) ? origin : allowed[0]);
+  const allowed = String(env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const allow = allowed.includes('*') ? '*' : (origin && allowed.includes(origin) ? origin : null);
+  if (!allow) return { Vary: 'Origin' };
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key, X-Space-Key, X-Review-Code',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Session, X-Space-Key, X-Review-Code, X-Turnstile-Token',
+    'Access-Control-Expose-Headers': 'X-Request-Id, Retry-After',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -984,19 +1234,46 @@ function safeEqual(a, b) {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
-const isSiteAdmin = (req, env) => safeEqual(req.headers.get('X-Admin-Key'), env.ADMIN_KEY);
 
+/** Reads a JSON body, counting bytes as they arrive (Content-Length can be absent or wrong). */
 async function readBody(request, max = 64 * 1024) {
   if (Number(request.headers.get('Content-Length')) > max) throw new HttpError(413, 'Request is too large');
-  try { return await request.json(); } catch { throw new HttpError(400, 'Body must be JSON'); }
+  if (!request.body) throw new HttpError(400, 'Body must be JSON');
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) { await reader.cancel().catch(() => {}); throw new HttpError(413, 'Request is too large'); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) { bytes.set(c, at); at += c.byteLength; }
+  let body;
+  try { body = JSON.parse(new TextDecoder().decode(bytes)); } catch { throw new HttpError(400, 'Body must be JSON'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'Body must be a JSON object');
+  return body;
 }
 
-function cleanText(value, max, label, optional = false) {
-  const s = String(value ?? '').replace(/\r\n/g, '\n').trim();
+/**
+ * Trims and length-checks user text and removes control characters. Single-line
+ * fields (names, titles, emails) also have line breaks and tabs turned into spaces.
+ */
+function cleanText(value, max, label, optional = false, multiline = false) {
+  let s = String(value ?? '').replace(/\r\n?/g, '\n');
+  s = multiline
+    ? s.replace(/[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]/g, '')
+    : s.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ');
+  s = s.trim();
   if (!s && !optional) throw new HttpError(400, `${label} is required`);
   if (s.length > max) throw new HttpError(400, `${label} must be ${max} characters or fewer`);
   return s;
 }
+// User text inside a git commit message: one short line, no quotes to break out of.
+const forCommit = (s) => String(s).replace(/[\u0000-\u001f\u007f"`]+/g, ' ').slice(0, 60);
 
 function must(value, label) {
   if (!value) throw new HttpError(404, `${label} not found`);

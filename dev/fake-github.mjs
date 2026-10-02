@@ -146,6 +146,12 @@ export function createFakeGitHub({ branches = ['review-data'], state, onChange }
       while (sha) { count++; sha = commits.get(sha).parents[0]; }
       return count;
     },
+    /** Commit messages reachable from a branch head, newest first. */
+    log(br = 'review-data') {
+      const out = [];
+      for (let sha = refs.get(br); sha; sha = commits.get(sha).parents[0]) out.push(commits.get(sha).message);
+      return out;
+    },
     serialize() {
       // Only keep objects reachable from a branch, so dev data doesn't grow forever.
       const live = { blobs: new Set(), trees: new Set(), commits: new Set() };
