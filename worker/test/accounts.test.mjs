@@ -31,6 +31,8 @@ test('session tokens: signature, issuer, origin, expiry and email are all checke
       r = await call('GET', '/api/me', { auth: `Bearer ${t}` });
       assert.equal(r.status, 401, why);
     }
+    r = await call('GET', '/api/me', { auth: `Bearer ${token({ ...nimal, email: undefined, name: undefined }, { primaryEmail: 'Nimal@Example.com', fullName: 'Nimal P' })}` });
+    assert.deepEqual([r.status, r.data.user.email, r.data.user.name], [200, 'nimal@example.com', 'Nimal P'], 'Clerk’s example claim names work too');
     r = await call('GET', '/api/me', { auth: `Bearer ${token({ ...nimal, email: '' })}` });
     assert.equal(r.status, 401);
     assert.match(r.data.error, /email claim/);

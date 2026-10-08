@@ -580,14 +580,17 @@ async function verifySession(env, request) {
   const origins = allowedOrigins(env);
   if (!origins.includes('*') && !origins.includes(claims.azp)) throw bad('azp');
   if (claims.sts && claims.sts !== 'active') throw bad('status');
-  const email = String(claims.email || '').trim().toLowerCase();
+  // `email` is what the README asks for; the others are names Clerk's own examples use.
+  const email = String(claims.email || claims.primaryEmail || claims.primary_email_address || '').trim().toLowerCase();
   if (!claims.sub || !EMAIL_RE.test(email)) {
+    // Claim names only, never values: enough to see what the session token is missing.
+    console.warn(JSON.stringify({ event: 'session_missing_email', claims: Object.keys(claims).sort(), requestId: requestIds.get(request) }));
     throw new HttpError(401, 'Your sign-in doesn’t include an email address. (Admin: add the email claim to the Clerk session token; see README.)');
   }
   return {
     id: String(claims.sub),
     email,
-    name: cleanText(String(claims.name || '').slice(0, 200), 200, 'Name', true).slice(0, MAX_NAME),
+    name: cleanText(String(claims.name || claims.fullName || '').slice(0, 200), 200, 'Name', true).slice(0, MAX_NAME),
     // fva = [minutes since first factor, minutes since second factor]; -1 = never.
     mfa: Array.isArray(claims.fva) && Number(claims.fva[1]) >= 0,
   };
