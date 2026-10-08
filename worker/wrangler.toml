@@ -57,7 +57,7 @@ MAX_PENDING_REQUESTS = "50"
 [[d1_databases]]
 binding = "DB"
 database_name = "review-desk"
-database_id = "REPLACE-WITH-DATABASE-ID"
+database_id = "32e61350-549b-4671-98d7-7909a04fce04"
 migrations_dir = "migrations"
 
 # Per-IP rate limits (per Cloudflare location, approximate). Without these bindings
