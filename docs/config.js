@@ -5,5 +5,5 @@ window.REVIEW_CONFIG = {
   apiUrl: 'https://screenshot-review-api.review-desk.workers.dev',
   // Clerk publishable key (public; starts with pk_test_ or pk_live_), from the Clerk
   // dashboard → API keys. Empty turns sign-in off: reviewers and demos still work.
-  clerkPublishableKey: '',
+  clerkPublishableKey: 'pk_test_ZXRoaWNhbC1zcGFycm93LTg3NTguY2xlcmsuYWNjb3VudHMuZGV2JA',
 };

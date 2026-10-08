@@ -24,7 +24,7 @@ SITE_URL = "https://eranthawelikala.github.io/review-desk/"
 # Sign-in (Clerk). The Frontend API URL of your Clerk instance, from the Clerk
 # dashboard: API keys → "Frontend API URL". Session tokens are checked against it
 # and its JWKS. Set CLERK_JWT_KEY (the PEM public key, same page) to skip the JWKS fetch.
-CLERK_ISSUER = "https://REPLACE-ME.clerk.accounts.dev"
+CLERK_ISSUER = "https://ethical-sparrow-8758.clerk.accounts.dev"
 # Site admins (SITE_ADMIN_EMAILS, a secret) must have two-step verification on.
 ADMIN_REQUIRE_MFA = "true"
 # Space keys of approved spaces made before accounts still allow editing until
