@@ -361,20 +361,32 @@
   /* ------------------------------------------------------------- page bits */
   const brand = (label = 'Review Desk') => `<a class="brand" href="#/" title="Review Desk home"><div class="brand-mark">${I.logo}</div><span>${esc(label)}</span></a>`;
 
-  // Sign-in button, or the signed-in account (opens Clerk's account page).
+  // Sign-in button, or the signed-in account with a Profile / Sign out dropdown.
+  // The dropdown opens and closes in place (toggleAccountMenu), so it works on
+  // every page, including error pages that have nothing else to redraw.
   function accountButton() {
     if (!CLERK_KEY) return '';
     if (!signedIn()) return `<button class="btn ghost sm" data-action="sign-in">${I.user}<span class="hide-xs">Sign in</span></button>`;
     const u = clerk.user;
-    const name = u.fullName || u.primaryEmailAddress?.emailAddress || 'Account';
-    return `<div class="menu-wrap"><button class="btn ghost sm account-btn" data-action="account-menu" aria-haspopup="menu" aria-expanded="${state.menuOpen === 'account'}" title="${esc(name)}">${avatar(name)}<span class="hide-sm">${esc(name)}</span></button>
-      ${state.menuOpen === 'account' ? `<div class="menu" role="menu">
-        <div class="menu-head">${esc(u.primaryEmailAddress?.emailAddress || '')}</div>
-        <button role="menuitem" data-action="manage-account">Manage account and security</button>
+    const email = u.primaryEmailAddress?.emailAddress || '';
+    const name = u.fullName || email || 'Account';
+    const open = state.menuOpen === 'account';
+    return `<div class="menu-wrap account-wrap"><button class="btn ghost sm account-btn" data-action="account-menu" aria-haspopup="menu" aria-expanded="${open}" title="${esc(name)}">${avatar(name)}<span class="hide-sm">${esc(name)}</span></button>
+      <div class="menu" role="menu" ${open ? '' : 'hidden'}>
+        <div class="menu-head"><b>${esc(name)}</b>${email && email !== name ? `<br>${esc(email)}` : ''}</div>
+        <button role="menuitem" data-action="manage-account">${I.user}Profile</button>
         <a role="menuitem" href="#/">Your spaces</a>
         ${state.account?.siteAdmin ? '<a role="menuitem" href="#/admin">Site admin</a>' : ''}
         <button role="menuitem" data-action="sign-out">Sign out</button>
-      </div>` : ''}</div>`;
+      </div></div>`;
+  }
+
+  function toggleAccountMenu(open = state.menuOpen !== 'account') {
+    state.menuOpen = open ? 'account' : false;
+    for (const wrap of document.querySelectorAll('.account-wrap')) {
+      wrap.querySelector('.menu').hidden = !open;
+      wrap.querySelector('.account-btn').setAttribute('aria-expanded', String(open));
+    }
   }
 
   function page(inner) {
@@ -658,6 +670,9 @@
         });
       }
       if (e.status === 404) return notice({ title: 'Space not found', text: 'It may have been deleted, or the link is incomplete.', actions: homeBtn });
+      if (e.status === 401) {
+        return notice({ icon: I.user, tone: 'danger', title: 'Sign-in problem', text: esc(e.message), actions: `<button class="btn" data-action="reload">Try again</button><button class="btn" data-action="sign-out">Sign out</button>` });
+      }
       return notice({ title: 'Can’t reach the review server', text: esc(e.message), actions: '<button class="btn" data-action="reload">Try again</button>' });
     }
     const c = creds.get(id);
@@ -1396,9 +1411,9 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
 
     // account
     'sign-in': () => signIn(),
-    'sign-out': () => { state.menuOpen = false; clerk?.signOut(); },
-    'manage-account': () => { state.menuOpen = false; clerk?.openUserProfile(); },
-    'account-menu': () => { state.menuOpen = state.menuOpen === 'account' ? false : 'account'; render(); },
+    'sign-out': () => { toggleAccountMenu(false); clerk?.signOut(); },
+    'manage-account': () => { toggleAccountMenu(false); clerk?.openUserProfile(); },
+    'account-menu': () => toggleAccountMenu(),
     'accept-invite': () => run(async () => {
       const r = await api('POST', `/api/invites/${encodeURIComponent(session.get('invite') || '')}/accept`, {}, { space: null });
       session.set('invite', null);
@@ -1743,15 +1758,17 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
 
   /* ----------------------------------------------------------------- events */
   document.addEventListener('click', (e) => {
-    if (state.menuOpen && !e.target.closest('.menu-wrap')) { state.menuOpen = false; render(); }
+    if (state.menuOpen === 'account' && !e.target.closest('.account-wrap')) toggleAccountMenu(false);
+    else if (state.menuOpen === 'space' && !e.target.closest('.menu-wrap')) { state.menuOpen = false; render(); }
     const el = e.target.closest('[data-action]');
     if (el && el.tagName !== 'FORM' && actions[el.dataset.action]) {
       e.preventDefault();
-      if (el.closest('.menu')) { state.menuOpen = false; $('.menu')?.remove(); }
+      if (el.closest('.account-wrap')) toggleAccountMenu(false);
+      else if (el.closest('.menu')) { state.menuOpen = false; el.closest('.menu').remove(); }
       actions[el.dataset.action](el);
       return;
     }
-    if (e.target.closest('.menu a')) { state.menuOpen = false; return; }
+    if (e.target.closest('.menu a')) { if (state.menuOpen === 'account') toggleAccountMenu(false); else state.menuOpen = false; return; }
     // Click on the screenshot drops a pin.
     const canvas = e.target.closest('#canvas');
     if (canvas && e.target.tagName === 'IMG') {
@@ -1786,6 +1803,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       e.target.form.requestSubmit();
       return;
     }
+    if (e.key === 'Escape' && state.menuOpen === 'account') { toggleAccountMenu(false); return; }
     if (e.key === 'Escape' && state.menuOpen) { state.menuOpen = false; render(); return; }
     if ($('#modal-root').innerHTML || !state.route.iid) return;
     if (e.target.matches?.('input, textarea')) {

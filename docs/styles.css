@@ -483,3 +483,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .share-result.ok { background: var(--ok-soft); }
 .share-result.ok p { margin: 0; }
 .share-result svg { width: 15px; height: 15px; color: var(--ok); }
+.menu[hidden] { display: none; }
+.account-wrap .menu-head { line-height: 1.45; }
+.account-wrap .menu-head b { color: var(--text); font-weight: 600; }
+.account-wrap .menu > button svg { width: 15px; height: 15px; margin-right: 8px; vertical-align: -3px; color: var(--text-2); }
