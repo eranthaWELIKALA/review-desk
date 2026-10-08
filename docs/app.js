@@ -152,12 +152,13 @@
   const usedBytes = () => (state.project?.sections || []).reduce((n, s) => n + s.images.reduce((m, i) => m + (i.bytes || 0), 0), 0);
   const meter = (used, quota) => `<span class="meter" role="img" aria-label="${fmtBytes(used)} of ${fmtBytes(quota)} used"><span style="width:${Math.min(100, quota ? (used / quota) * 100 : 0).toFixed(1)}%" class="${used / quota > 0.9 ? 'full' : ''}"></span></span>`;
 
+  // type 'busy' shows a spinner and stays until the caller removes it.
   function toast(msg, type = '') {
     const el = document.createElement('div');
     el.className = `toast ${type}`;
     el.textContent = msg;
     $('#toasts').append(el);
-    setTimeout(() => el.remove(), type === 'error' ? 6000 : 3000);
+    if (type !== 'busy') setTimeout(() => el.remove(), type === 'error' ? 6000 : 3000);
     return el;
   }
 
@@ -226,6 +227,32 @@
     return state.account;
   }
 
+  /* ------------------------------------------------------------- busy state */
+  // A thin bar at the top while any request has been running for over 150 ms
+  // (quicker ones don't flash it), and a spinner on the button that started it.
+  let inFlight = 0;
+  let progressTimer = null;
+  function trackRequest(delta) {
+    inFlight = Math.max(0, inFlight + delta);
+    const bar = $('#progress');
+    if (!bar) return;
+    if (inFlight && !progressTimer && bar.hidden) {
+      progressTimer = setTimeout(() => { progressTimer = null; if (inFlight) { bar.hidden = false; document.body.setAttribute('aria-busy', 'true'); } }, 150);
+    } else if (!inFlight) {
+      clearTimeout(progressTimer);
+      progressTimer = null;
+      bar.hidden = true;
+      document.body.removeAttribute('aria-busy');
+    }
+  }
+
+  function setBusy(el, on) {
+    if (!el) return;
+    el.classList.toggle('busy', on);
+    if (on) el.setAttribute('aria-busy', 'true'); else el.removeAttribute('aria-busy');
+    if ('disabled' in el) el.disabled = on;
+  }
+
   /* -------------------------------------------------------------------- api */
   async function api(method, path, body, { space = spaceId(), headers: extra = {} } = {}, retried = false) {
     const headers = { ...extra, ...(await authHeader(retried)) };
@@ -235,13 +262,16 @@
       if (c.key) headers['X-Space-Key'] = c.key;
       if (c.code) headers['X-Review-Code'] = c.code;
     }
-    let res;
+    let res, data;
+    trackRequest(1);
     try {
       res = await fetch(API + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      data = await res.json().catch(() => ({}));
     } catch {
       throw new Error('Could not reach the review server. Check your connection and try again.');
+    } finally {
+      trackRequest(-1);
     }
-    const data = await res.json().catch(() => ({}));
     // A session token can expire in flight: get a fresh one and try once more.
     if (res.status === 401 && headers.Authorization && !retried) return api(method, path, body, { space, headers: extra }, true);
     if (!res.ok) {
@@ -392,7 +422,7 @@
   function page(inner) {
     $('#app').innerHTML = `<header class="topbar">${brand()}<div class="spacer"></div>${accountButton()}</header><main class="page">${inner}</main>`;
   }
-  function loading() { $('#app').innerHTML = '<div class="boot">Loading…</div>'; }
+  function loading() { $('#app').innerHTML = '<div class="boot"><span class="spinner" aria-hidden="true"></span>Loading…</div>'; }
 
   function notice({ icon = '', tone = '', title, text = '', actions = '' }) {
     page(`<div class="notice ${tone}">${icon ? `<div class="notice-icon">${icon}</div>` : ''}<h1>${esc(title)}</h1>${text ? `<p>${text}</p>` : ''}${actions ? `<div class="notice-actions">${actions}</div>` : ''}</div>`);
@@ -1343,13 +1373,14 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       const missing = fields.find((f) => f.required && !String(values[f.name] || '').trim());
       const err = $('.err', form);
       if (missing) { err.textContent = `${missing.label} is required.`; err.hidden = false; return; }
-      const btn = form.querySelector('[type=submit]');
-      btn.disabled = true;
+      // The button that was pressed (Send, Invite, or the confirm button) shows the spinner.
+      const btn = e.submitter || form.querySelector('[type=submit]');
+      setBusy(btn, true);
       try {
         const keep = await onSubmit(values, e.submitter);
-        if (keep === false) btn.disabled = false; else if (root.contains(form)) close();
+        if (keep === false) setBusy(btn, false); else if (root.contains(form)) close();
       } catch (ex) {
-        err.textContent = ex.message; err.hidden = false; btn.disabled = false;
+        err.textContent = ex.message; err.hidden = false; setBusy(btn, false);
       }
     };
     if (!coarse) (form.querySelector('input:not([readonly]),textarea:not([readonly])') || form.querySelector('[type=submit]')).focus();
@@ -1706,12 +1737,12 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     if (!parentId && target !== 'section' && state.pinDraft) body.pin = state.pinDraft;
 
     const btn = form.querySelector('[type=submit]');
-    btn.disabled = true;
+    setBusy(btn, true);
     const ok = await run(async () => {
       applySection(await api('POST', `/api/s/${spaceId()}/sections/${s.id}/comments`, body));
       return true;
     });
-    btn.disabled = false;
+    setBusy(btn, false);
     if (ok) {
       delete state.drafts[key];
       if (parentId) state.replyTo = null; else state.pinDraft = null;
@@ -1730,7 +1761,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     const images = [...files].filter((f) => /^image\/(png|jpe?g|gif|webp)$/.test(f.type));
     if (!images.length) return toast('Only PNG, JPG, GIF or WebP images can be uploaded', 'error');
     let done = 0;
-    const t = toast(`Uploading 1 of ${images.length}…`);
+    const t = toast(`Uploading 1 of ${images.length}…`, 'busy');
     for (const file of images) {
       t.textContent = `Uploading ${done + 1} of ${images.length}…`;
       const left = state.project.space.quotaBytes - usedBytes();
@@ -1765,7 +1796,12 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       e.preventDefault();
       if (el.closest('.account-wrap')) toggleAccountMenu(false);
       else if (el.closest('.menu')) { state.menuOpen = false; el.closest('.menu').remove(); }
-      actions[el.dataset.action](el);
+      if (el.classList.contains('busy')) return; // already working on it
+      const out = actions[el.dataset.action](el);
+      if (out?.then) {
+        setBusy(el, true);
+        out.finally(() => setBusy(el, false));
+      }
       return;
     }
     if (e.target.closest('.menu a')) { if (state.menuOpen === 'account') toggleAccountMenu(false); else state.menuOpen = false; return; }
