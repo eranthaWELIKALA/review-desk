@@ -206,6 +206,20 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .open-form .input { flex: 1; min-width: 0; height: 34px; }
 
 .list-block { margin-top: 36px; }
+.how { margin-top: 44px; }
+.how-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.how-head h3 { margin: 0; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+.how-head a { font-size: 14px; font-weight: 500; color: var(--accent-text); }
+.how-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+.how-step { display: flex; flex-direction: column; border-radius: 12px; overflow: hidden; background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow); color: var(--text); text-decoration: none; transition: border-color .15s, transform .15s; }
+.how-step:hover { border-color: var(--accent); transform: translateY(-2px); }
+.how-img { aspect-ratio: 16 / 10; overflow: hidden; background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.how-img img { width: 100%; height: 100%; object-fit: cover; object-position: top left; display: block; }
+.how-body { display: grid; grid-template-columns: auto 1fr; column-gap: 10px; row-gap: 2px; padding: 12px 14px 14px; font-size: 13.5px; }
+.how-body b { font-size: 14.5px; align-self: center; }
+.how-body span:last-child { grid-column: 2; color: var(--text-2); line-height: 1.45; }
+.how-num { grid-row: span 2; width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-text); font-size: 12px; font-weight: 600; display: grid; place-items: center; margin-top: 1px; }
+@media (prefers-reduced-motion: reduce) { .how-step { transition: none; } .how-step:hover { transform: none; } }
 .list-block h3 { margin: 0 0 10px; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
 .rows { display: grid; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
 .row-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px 4px 0; }

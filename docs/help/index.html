@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="How to use Review Desk: demos, spaces, sharing, reviewing and working as a team.">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1e1c1a" media="(prefers-color-scheme: dark)">
+  <title>Help · Review Desk</title>
+  <meta name="robots" content="noindex">
+  <meta name="referrer" content="no-referrer">
+  <!-- A static page: no scripts, images from this site only. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e8590c'/%3E%3Cpath d='M9 11h14v10H9z' fill='none' stroke='white' stroke-width='2.4' stroke-linejoin='round'/%3E%3Ccircle cx='21' cy='21' r='4' fill='white'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="help.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../#/"><span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M9 11h14v10H9z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/><circle cx="21" cy="21" r="4" fill="currentColor"/></svg></span>Review Desk</a>
+    <span class="chip">Help</span>
+    <span class="spacer"></span>
+    <a class="btn" href="../#/">Open Review Desk</a>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="On this page">
+      <p class="toc-title">On this page</p>
+      <ol>
+        <li><a href="#basics">How it works</a></li>
+        <li><a href="#demo">Try a demo</a></li>
+        <li><a href="#upload">Sections and screenshots</a></li>
+        <li><a href="#pin">Pin feedback</a></li>
+        <li><a href="#share">Share with reviewers</a></li>
+        <li><a href="#review">Reviewing a design</a></li>
+        <li><a href="#manage">Reply and resolve</a></li>
+        <li><a href="#space">Get your own space</a></li>
+        <li><a href="#team">Add team members</a></li>
+        <li><a href="#join">Join as an editor</a></li>
+        <li><a href="#admin">Site admin</a></li>
+        <li><a href="#faq">Tips and questions</a></li>
+      </ol>
+    </nav>
+
+    <main class="content">
+      <section class="intro">
+        <h1>How to use Review Desk</h1>
+        <p class="lead">Upload screenshots, send one link, and get feedback pinned to the exact spot on the design. This guide walks through everything, from a quick demo to running a space with your team.</p>
+        <div class="paths">
+          <a class="path" href="#demo"><b>Just trying it out?</b><span>Start a demo. No account needed.</span></a>
+          <a class="path" href="#review"><b>Someone sent you a link?</b><span>See how to leave feedback.</span></a>
+          <a class="path" href="#space"><b>Running a real project?</b><span>Get a space and invite your team.</span></a>
+        </div>
+      </section>
+
+      <section id="basics">
+        <h2><span class="num">1</span>How it works</h2>
+        <p>Everything lives in a <b>space</b>. A space holds <b>sections</b> (for example “Sign-up flow” or “Checkout”), and each section holds screenshots. People comment on a whole section, or click a screenshot to pin a comment to one spot.</p>
+        <p>There are four kinds of people:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th></th><th>Reviewer</th><th>Editor</th><th>Owner</th><th>Site admin</th></tr></thead>
+            <tbody>
+              <tr><td>View screenshots, comment, pin, reply</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+              <tr><td>Create sections, upload, edit captions</td><td></td><td>✓</td><td>✓</td><td>✓</td></tr>
+              <tr><td>Resolve and delete comments</td><td></td><td>✓</td><td>✓</td><td>✓</td></tr>
+              <tr><td>Share the review link, email it, issue a new review code</td><td></td><td>✓</td><td>✓</td><td>✓</td></tr>
+              <tr><td>Invite editors and owners, change roles, remove members</td><td></td><td></td><td>✓</td><td>✓</td></tr>
+              <tr><td>Approve space requests, manage every space</td><td></td><td></td><td></td><td>✓</td></tr>
+              <tr><td>Needs an account</td><td>No</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>Demo or a space?</h3>
+        <div class="table-wrap">
+          <table class="compare">
+            <thead><tr><th></th><th>Demo</th><th>Space</th></tr></thead>
+            <tbody>
+              <tr><td>How to get one</td><td>One click, no sign-up</td><td>Sign in and request one; an admin approves it</td></tr>
+              <tr><td>Storage</td><td>5 MB</td><td>200 MB (an admin can change it)</td></tr>
+              <tr><td>How long it lasts</td><td>Deleted after 24 hours</td><td>Until it’s deleted</td></tr>
+              <tr><td>Reviewers by link</td><td>✓</td><td>✓</td></tr>
+              <tr><td>Editors and co-owners</td><td>No</td><td>✓</td></tr>
+              <tr><td>Email invites</td><td>No</td><td>✓</td></tr>
+              <tr><td>Who controls it</td><td>The browser that started it</td><td>Your account, on any device</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="demo">
+        <h2><span class="num">2</span>Try a demo</h2>
+        <p>A demo is a private, temporary space for trying Review Desk alone. You don’t need an account.</p>
+        <ol class="steps">
+          <li>On the home page, click <b>Start a demo</b>.
+            <figure><a href="img/01-home.webp" title="Open full size"><img src="img/01-home.webp" width="1280" height="800" alt="The home page. Start a demo, request your own space, or paste a link someone sent you." loading="lazy" decoding="async"></a><figcaption>The home page. Start a demo, request your own space, or paste a link someone sent you.</figcaption></figure></li>
+          <li>Your demo space opens. You own it, and it’s deleted automatically after 24 hours. Click <b>Get started</b>.
+            <figure class="narrow"><a href="img/02-demo-welcome.webp" title="Open full size"><img src="img/02-demo-welcome.webp" width="524" height="252" alt="The welcome message tells you how much storage you have and when the demo ends." loading="lazy" decoding="async"></a><figcaption>The welcome message tells you how much storage you have and when the demo ends.</figcaption></figure></li>
+          <li>The blue bar at the top shows the time left and the storage used. <b>Get a permanent space</b> takes you to the request form.
+            <figure><a href="img/03-demo-empty.webp" title="Open full size"><img src="img/03-demo-empty.webp" width="1280" height="800" alt="An empty demo space, ready for its first section." loading="lazy" decoding="async"></a><figcaption>An empty demo space, ready for its first section.</figcaption></figure></li>
+        </ol>
+        <p class="note">The demo belongs to the browser that started it. If you clear your browser data or switch devices, you lose access to it. To come back later in the same browser, use <b>Continue your demo</b> on the home page.</p>
+      </section>
+
+      <section id="upload">
+        <h2><span class="num">3</span>Sections and screenshots</h2>
+        <ol class="steps">
+          <li>Click <b>New section</b> (or <b>Create first section</b>). Give it a title, and add a description to tell reviewers what to focus on.
+            <figure class="narrow"><a href="img/04-new-section.webp" title="Open full size"><img src="img/04-new-section.webp" width="524" height="420" alt="The description appears at the top of the section for every reviewer." loading="lazy" decoding="async"></a><figcaption>The description appears at the top of the section for every reviewer.</figcaption></figure></li>
+          <li>Add screenshots in any of three ways:
+            <ul>
+              <li>click <b>Upload</b> and choose files,</li>
+              <li>drag files onto the dashed box, or</li>
+              <li>copy a screenshot and paste it with <kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>V</kbd>.</li>
+            </ul>
+            <figure><a href="img/05-section-uploaded.webp" title="Open full size"><img src="img/05-section-uploaded.webp" width="1280" height="800" alt="A section with three screenshots. Copy link, Edit, Delete and Upload are at the top right." loading="lazy" decoding="async"></a><figcaption>A section with three screenshots. Copy link, Edit, Delete and Upload are at the top right.</figcaption></figure></li>
+        </ol>
+        <p>PNG, JPG, GIF and WebP files up to 15 MB each are accepted. A space can have up to 40 sections. Use <b>Edit</b> to rename a section or change its description, and the pencil next to the space name to rename the space.</p>
+      </section>
+
+      <section id="pin">
+        <h2><span class="num">4</span>Pin feedback to a spot</h2>
+        <ol class="steps">
+          <li>Click a screenshot to open it. Comments are listed on the right.
+            <figure><a href="img/06-viewer-empty.webp" title="Open full size"><img src="img/06-viewer-empty.webp" width="1280" height="800" alt="The screenshot viewer. Use the arrows (or ← →) to move between screenshots and Esc to close." loading="lazy" decoding="async"></a><figcaption>The screenshot viewer. Use the arrows (or ← →) to move between screenshots and Esc to close.</figcaption></figure></li>
+          <li>Click anywhere on the screenshot. A pin appears where you clicked. Type your comment and click <b>Post</b>.
+            <figure><a href="img/07-pin-draft.webp" title="Open full size"><img src="img/07-pin-draft.webp" width="1280" height="800" alt="“Pinned to a spot” means the comment will be attached to that point. Click × to remove the pin and comment on the whole screenshot instead." loading="lazy" decoding="async"></a><figcaption>“Pinned to a spot” means the comment will be attached to that point. Click × to remove the pin and comment on the whole screenshot instead.</figcaption></figure></li>
+        </ol>
+        <p>Each pinned comment gets a number that matches its pin. Hover over a pin to preview the comment, and click it to jump to the comment. The toolbar can switch between <b>fit to screen</b> and <b>actual size</b>, and can copy a link straight to this screenshot.</p>
+      </section>
+
+      <section id="share">
+        <h2><span class="num">5</span>Share with reviewers</h2>
+        <p>Reviewers don’t need an account. They only need the review link.</p>
+        <ol class="steps">
+          <li>Click <b>Share</b> at the top of the space. The <b>Reviewers</b> tab shows the review link and the review code. Click <b>Copy link</b> and send it any way you like.
+            <figure class="narrow"><a href="img/08-share-demo.webp" title="Open full size"><img src="img/08-share-demo.webp" width="524" height="552" alt="In a demo, the link stops working when the demo ends." loading="lazy" decoding="async"></a><figcaption>In a demo, the link stops working when the demo ends.</figcaption></figure></li>
+          <li>If you’re signed in, you can also email the link. Type an address and click <b>Send</b>.
+            <figure class="narrow"><a href="img/33-share-sent.webp" title="Open full size"><img src="img/33-share-sent.webp" width="524" height="606" alt="The email says who sent it. If email isn’t available, you get the link to send yourself." loading="lazy" decoding="async"></a><figcaption>The email says who sent it. If email isn’t available, you get the link to send yourself.</figcaption></figure></li>
+        </ol>
+        <p><b>Copy link</b> on a section, or the link icon in the viewer, copies a link that opens that exact section or screenshot.</p>
+        <h3>Cut off access</h3>
+        <p>To stop old links from working, open the <b>⋯</b> menu and choose <b>New review code…</b>. Everyone with the old link loses access until you send them the new one.</p>
+        <div class="fig-row">
+          <figure><a href="img/10-space-menu.webp" title="Open full size"><img src="img/10-space-menu.webp" width="640" height="400" alt="The ⋯ menu." loading="lazy" decoding="async"></a><figcaption>The ⋯ menu.</figcaption></figure>
+          <figure><a href="img/40-new-code-confirm.webp" title="Open full size"><img src="img/40-new-code-confirm.webp" width="524" height="231" alt="Confirm to issue a new code." loading="lazy" decoding="async"></a><figcaption>Confirm to issue a new code.</figcaption></figure>
+        </div>
+      </section>
+
+      <section id="review">
+        <h2><span class="num">6</span>Reviewing a design</h2>
+        <p>This part is for people who were sent a review link.</p>
+        <ol class="steps">
+          <li>Open the link. You’ll see the sections on the left and the screenshots in the middle. Sections with a number in orange have open comments.
+            <figure><a href="img/11-reviewer-section.webp" title="Open full size"><img src="img/11-reviewer-section.webp" width="1280" height="800" alt="What a reviewer sees. There are no upload or delete buttons." loading="lazy" decoding="async"></a><figcaption>What a reviewer sees. There are no upload or delete buttons.</figcaption></figure></li>
+          <li>To comment on the whole flow, use <b>Section feedback</b> under the screenshots. The first time, type your name. It’s remembered for next time.
+            <figure><a href="img/12-reviewer-section-comment.webp" title="Open full size"><img src="img/12-reviewer-section-comment.webp" width="1280" height="800" alt="Section feedback is for general thoughts about the flow." loading="lazy" decoding="async"></a><figcaption>Section feedback is for general thoughts about the flow.</figcaption></figure></li>
+          <li>To comment on one detail, open a screenshot and click the spot. Your pins are numbered in the order they were added.
+            <figure><a href="img/13-reviewer-pins.webp" title="Open full size"><img src="img/13-reviewer-pins.webp" width="1280" height="800" alt="Two pinned comments. The highlighted comment matches the pin under the cursor." loading="lazy" decoding="async"></a><figcaption>Two pinned comments. The highlighted comment matches the pin under the cursor.</figcaption></figure></li>
+        </ol>
+        <p>Review Desk works on phones too: tap a screenshot to open it, then tap a spot to pin a comment.</p>
+        <div class="fig-row phones">
+          <figure><a href="img/14-reviewer-phone.webp" title="Open full size"><img src="img/14-reviewer-phone.webp" width="390" height="780" alt="Sections become tabs on a phone." loading="lazy" decoding="async"></a><figcaption>Sections become tabs on a phone.</figcaption></figure>
+          <figure><a href="img/15-reviewer-phone-viewer.webp" title="Open full size"><img src="img/15-reviewer-phone-viewer.webp" width="390" height="780" alt="Tap to pin, then type below." loading="lazy" decoding="async"></a><figcaption>Tap to pin, then type below.</figcaption></figure>
+        </div>
+        <p class="note">If you’re signed in, your comments show your account name with a ✓, so nobody can post under your name. Without an account, the name is whatever you type. You can change it in the <b>⋯</b> menu.</p>
+      </section>
+
+      <section id="manage">
+        <h2><span class="num">7</span>Reply and resolve</h2>
+        <p>Owners and editors keep track of feedback as it comes in.</p>
+        <ol class="steps">
+          <li>Click <b>Refresh</b> to load the newest comments. Screenshots with open comments show an orange badge.
+            <figure><a href="img/16-owner-badges.webp" title="Open full size"><img src="img/16-owner-badges.webp" width="1280" height="800" alt="The badge counts open comments on each screenshot. Section feedback is listed underneath." loading="lazy" decoding="async"></a><figcaption>The badge counts open comments on each screenshot. Section feedback is listed underneath.</figcaption></figure></li>
+          <li>Click <b>Reply</b> under a comment to answer it in a thread.
+            <figure><a href="img/17-reply.webp" title="Open full size"><img src="img/17-reply.webp" width="1280" height="800" alt="Replies stay grouped under the original comment." loading="lazy" decoding="async"></a><figcaption>Replies stay grouped under the original comment.</figcaption></figure></li>
+          <li>Click <b>Resolve</b> when a comment has been dealt with. It’s hidden from the list and its pin disappears.
+            <figure><a href="img/18-resolved.webp" title="Open full size"><img src="img/18-resolved.webp" width="1280" height="800" alt="One comment resolved. “Show 1 resolved comment” brings it back." loading="lazy" decoding="async"></a><figcaption>One comment resolved. “Show 1 resolved comment” brings it back.</figcaption></figure></li>
+          <li>Click <b>Show resolved comments</b> to see them again (their pins turn green), and <b>Reopen</b> to make one open again.
+            <figure><a href="img/19-show-resolved.webp" title="Open full size"><img src="img/19-show-resolved.webp" width="1280" height="800" alt="Resolved comments are marked ✓ Resolved." loading="lazy" decoding="async"></a><figcaption>Resolved comments are marked ✓ Resolved.</figcaption></figure></li>
+        </ol>
+      </section>
+
+      <section id="space">
+        <h2><span class="num">8</span>Get your own space</h2>
+        <p>A space is permanent, has more storage, and lets you work with a team.</p>
+        <ol class="steps">
+          <li>Click <b>Sign in</b> at the top right. You can use Google, GitHub, Microsoft or an email link. Your account menu (top right) has your profile and a list of your spaces.
+            <figure class="narrow"><a href="img/21-account-menu.webp" title="Open full size"><img src="img/21-account-menu.webp" width="640" height="400" alt="The account menu." loading="lazy" decoding="async"></a><figcaption>The account menu.</figcaption></figure></li>
+          <li>Click <b>Request a space</b>. Tell us what you’ll review and click <b>Send request</b>.
+            <figure class="narrow"><a href="img/22-request-modal.webp" title="Open full size"><img src="img/22-request-modal.webp" width="524" height="441" alt="A sentence or two about the project is enough." loading="lazy" decoding="async"></a><figcaption>A sentence or two about the project is enough.</figcaption></figure></li>
+          <li>Your request appears on the home page as <b>Waiting for approval</b>. You’ll get an email when an admin approves it.
+            <figure><a href="img/23-request-pending.webp" title="Open full size"><img src="img/23-request-pending.webp" width="1280" height="800" alt="The request status is shown under “Your space requests”." loading="lazy" decoding="async"></a><figcaption>The request status is shown under “Your space requests”.</figcaption></figure></li>
+          <li>Once it’s approved, the space appears under <b>Your spaces</b>, and you’re its owner. Open it from any device by signing in.
+            <figure><a href="img/29-home-your-space.webp" title="Open full size"><img src="img/29-home-your-space.webp" width="1280" height="800" alt="“Leafy” is ready. Your role (Owner) is shown under the name." loading="lazy" decoding="async"></a><figcaption>“Leafy” is ready. Your role (Owner) is shown under the name.</figcaption></figure></li>
+          <li>Create sections and upload screenshots as in <a href="#upload">step 3</a>. The bar at the top shows how much storage you’ve used.
+            <figure><a href="img/31-space-with-shots.webp" title="Open full size"><img src="img/31-space-with-shots.webp" width="1280" height="800" alt="A space with its first section." loading="lazy" decoding="async"></a><figcaption>A space with its first section.</figcaption></figure></li>
+        </ol>
+      </section>
+
+      <section id="team">
+        <h2><span class="num">9</span>Add team members</h2>
+        <p>Owners can invite <b>editors</b> (who upload screenshots and manage feedback) and other <b>owners</b> (who can also manage the team).</p>
+        <ol class="steps">
+          <li>Click <b>Share</b> and open the <b>Team</b> tab. Type your teammate’s email address, choose <b>Editor</b> or <b>Owner</b>, and click <b>Invite</b>.
+            <figure class="narrow"><a href="img/34-team-invite.webp" title="Open full size"><img src="img/34-team-invite.webp" width="524" height="451" alt="The Team tab lists everyone who has access." loading="lazy" decoding="async"></a><figcaption>The Team tab lists everyone who has access.</figcaption></figure></li>
+          <li>They get an email with an invite link. Until they accept, the invite is listed as pending. Click <b>Cancel</b> to withdraw it.
+            <figure class="narrow"><a href="img/35-team-pending.webp" title="Open full size"><img src="img/35-team-pending.webp" width="524" height="562" alt="A pending invite expires after 7 days." loading="lazy" decoding="async"></a><figcaption>A pending invite expires after 7 days.</figcaption></figure></li>
+          <li>After they accept, they’re listed as a member. Use <b>Make owner</b> / <b>Make editor</b> to change their role, or <b>Remove</b> to take away access.
+            <figure class="narrow"><a href="img/39-team-members.webp" title="Open full size"><img src="img/39-team-members.webp" width="524" height="509" alt="Sam is now an editor." loading="lazy" decoding="async"></a><figcaption>Sam is now an editor.</figcaption></figure></li>
+        </ol>
+        <p class="note">Invites are single-use and only work for the email address they were sent to. If someone forwards an invite, it won’t work for anyone else. A space always keeps at least one owner.</p>
+      </section>
+
+      <section id="join">
+        <h2><span class="num">10</span>Join a space as an editor</h2>
+        <p>This part is for people who were invited to a team.</p>
+        <ol class="steps">
+          <li>Open the link in your invite email. Click <b>Sign in to accept</b>, and sign in with the email address the invite was sent to.
+            <figure class="narrow"><a href="img/36-invite-signed-out.webp" title="Open full size"><img src="img/36-invite-signed-out.webp" width="656" height="343" alt="The invite page shows who invited you and to which space." loading="lazy" decoding="async"></a><figcaption>The invite page shows who invited you and to which space.</figcaption></figure></li>
+          <li>Click <b>Accept invite</b>. If you’re signed in with a different email address, click <b>Use another account</b>.
+            <figure class="narrow"><a href="img/37-invite-accept.webp" title="Open full size"><img src="img/37-invite-accept.webp" width="656" height="375" alt="Signed in with the right address." loading="lazy" decoding="async"></a><figcaption>Signed in with the right address.</figcaption></figure></li>
+          <li>The space opens, and it’s now listed under <b>Your spaces</b> on the home page.
+            <figure><a href="img/38-editor-space.webp" title="Open full size"><img src="img/38-editor-space.webp" width="1280" height="800" alt="Editors see Upload, Edit and Share, just like owners." loading="lazy" decoding="async"></a><figcaption>Editors see Upload, Edit and Share, just like owners.</figcaption></figure></li>
+        </ol>
+        <p>To leave a space, open the <b>⋯</b> menu and choose <b>Leave this space…</b>.</p>
+      </section>
+
+      <section id="admin">
+        <h2><span class="num">11</span>Site admin</h2>
+        <p>Site admins approve requests and look after every space. The admin console needs two-step verification turned on for your account. Open it from your account menu → <b>Site admin</b>.</p>
+        <ol class="steps">
+          <li><b>Requests</b> lists new space requests. Click <b>Approve</b> or <b>Reject</b> (you can give a reason, which the requester sees).
+            <figure><a href="img/24-admin-requests.webp" title="Open full size"><img src="img/24-admin-requests.webp" width="1280" height="420" alt="A request waiting for approval." loading="lazy" decoding="async"></a><figcaption>A request waiting for approval.</figcaption></figure></li>
+          <li>When approving, choose the space name and its storage.
+            <figure class="narrow"><a href="img/25-admin-approve.webp" title="Open full size"><img src="img/25-admin-approve.webp" width="524" height="387" alt="The requester becomes the owner." loading="lazy" decoding="async"></a><figcaption>The requester becomes the owner.</figcaption></figure></li>
+          <li>The space is created and the owner is emailed. You also get the links, in case you need to pass them on.
+            <figure class="narrow"><a href="img/26-admin-created.webp" title="Open full size"><img src="img/26-admin-created.webp" width="524" height="352" alt="The space link and the reviewer link." loading="lazy" decoding="async"></a><figcaption>The space link and the reviewer link.</figcaption></figure></li>
+          <li><b>Spaces</b> shows each space’s owner and storage use. From here you can open a space, view its keys, change its storage, issue a new key, or delete it.
+            <figure><a href="img/27-admin-spaces.webp" title="Open full size"><img src="img/27-admin-spaces.webp" width="1280" height="420" alt="One row per space." loading="lazy" decoding="async"></a><figcaption>One row per space.</figcaption></figure></li>
+          <li><b>Demos</b> lists the demos currently running. <b>Activity</b> is a log of security-relevant actions, such as approvals, invites and role changes, kept for a year.
+            <figure><a href="img/28-admin-activity.webp" title="Open full size"><img src="img/28-admin-activity.webp" width="1280" height="420" alt="The activity log." loading="lazy" decoding="async"></a><figcaption>The activity log.</figcaption></figure></li>
+        </ol>
+        <p>Use <b>New space</b> at the top to create a space for someone directly, without a request.</p>
+      </section>
+
+      <section id="faq">
+        <h2><span class="num">12</span>Tips and questions</h2>
+        <h3>Keyboard shortcuts in the viewer</h3>
+        <div class="table-wrap">
+          <table class="keys">
+            <tbody>
+              <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Previous / next screenshot</td></tr>
+              <tr><td><kbd>Esc</kbd></td><td>Remove the pin you’re placing, or close the viewer</td></tr>
+              <tr><td><kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>V</kbd></td><td>Paste a screenshot into the open section (owners and editors)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <details>
+          <summary>I don’t see new comments.</summary>
+          <p>Click <b>Refresh</b> at the top of the space. New comments also load by themselves when you come back to the tab after a minute or more away.</p>
+        </details>
+        <details>
+          <summary>My demo has gone.</summary>
+          <p>Demos are deleted 24 hours after they start, together with their screenshots and comments. You can start a new one, or request a space for anything you want to keep.</p>
+        </details>
+        <details>
+          <summary>The review link says the code no longer works.</summary>
+          <p>The owner issued a new review code, which stops old links from working. Ask them for the new link.</p>
+        </details>
+        <details>
+          <summary>My invite doesn’t work.</summary>
+          <p>Invites expire after 7 days, work only once, and only for the email address they were sent to. Make sure you’re signed in with that address. If it has expired, ask the owner to send a new one.</p>
+        </details>
+        <details>
+          <summary>I have a space key that starts with “sk-”.</summary>
+          <p>Spaces made before accounts use a space key. Paste it under <b>Have a link?</b> on the home page, then sign in and choose <b>Make your account the owner</b> in the bar at the top. After that, the key stops working and you manage the space with your account.</p>
+        </details>
+        <details>
+          <summary>What does “Forget on this device” do?</summary>
+          <p>It removes the space from this browser’s list. It doesn’t delete anything. For a space on your account, it will still be under <b>Your spaces</b>.</p>
+        </details>
+        <details>
+          <summary>The space is full.</summary>
+          <p>Delete screenshots you no longer need (open one, then click the bin icon), or ask the site admin for more storage.</p>
+        </details>
+      </section>
+
+      <footer class="foot"><a class="btn primary" href="../#/">Open Review Desk</a></footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -75,7 +75,7 @@ installFakeGitHub(fake);
 // Same schedule as production would be too slow to try out; run cleanup every minute.
 setInterval(() => worker.scheduled({}, env, { waitUntil: () => {} }), 60_000);
 
-const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webp': 'image/webp' };
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -106,7 +106,7 @@ http.createServer(async (req, res) => {
     res.end(JSON.stringify({ token: devToken(u, req.headers.origin || `http://localhost:${PORT}`) }));
     return;
   }
-  const file = path.join(site, url.pathname === '/' ? 'index.html' : url.pathname);
+  const file = path.join(site, url.pathname.endsWith('/') ? `${url.pathname}index.html` : url.pathname);
   if (!file.startsWith(site)) { res.writeHead(400); return res.end(); }
   try {
     const buf = await fs.readFile(file);

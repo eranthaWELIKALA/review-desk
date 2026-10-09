@@ -64,6 +64,7 @@ GitHub Pages can only serve static files and can't keep a secret, so a small **C
 | `#/invite` | Accept an invite to own or edit a space |
 | `#/admin` | Site admin console: requests, spaces, demos, activity |
 | `#/r/<request>` | Status of a request made before accounts |
+| `help/` | Help: illustrated tutorials for every feature (static page, no scripts) |
 
 ## Try it locally (2 minutes, no accounts)
 

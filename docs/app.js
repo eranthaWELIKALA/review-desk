@@ -407,6 +407,7 @@
         <button role="menuitem" data-action="manage-account">${I.user}Profile</button>
         <a role="menuitem" href="#/">Your spaces</a>
         ${state.account?.siteAdmin ? '<a role="menuitem" href="#/admin">Site admin</a>' : ''}
+        <a role="menuitem" href="help/">Help</a>
         <button role="menuitem" data-action="sign-out">Sign out</button>
       </div></div>`;
   }
@@ -548,8 +549,29 @@
           </div>
         </section>` : ''}
 
-        <footer class="home-foot"><a href="#/admin">Site admin</a></footer>
+        ${howItWorks()}
+
+        <footer class="home-foot"><a href="help/">Help</a> · <a href="#/admin">Site admin</a></footer>
       </main>`;
+  }
+
+  // A glimpse of the help page: four steps, each linking to its part of the guide.
+  function howItWorks() {
+    const steps = [
+      ['upload', '05-section-uploaded', 'Upload screenshots', 'Group them into sections. Drag, paste or upload.'],
+      ['share', '08-share-demo', 'Share one link', 'Reviewers open it and comment. No account needed.'],
+      ['pin', '13-reviewer-pins', 'Get pinned feedback', 'Every comment points at the exact spot it’s about.'],
+      ['team', '39-team-members', 'Work as a team', 'Invite editors and owners to your space by email.'],
+    ];
+    return `<section class="how" aria-labelledby="how-title">
+      <div class="how-head"><h3 id="how-title">How it works</h3><a href="help/">Read the full guide</a></div>
+      <div class="how-grid">${steps.map(([anchor, img, title, text], i) => `
+        <a class="how-step" href="help/#${anchor}">
+          <div class="how-img"><img src="help/img/${img}.webp" alt="" loading="lazy" decoding="async"></div>
+          <div class="how-body"><span class="how-num">${i + 1}</span><b>${title}</b><span>${text}</span></div>
+        </a>`).join('')}
+      </div>
+    </section>`;
   }
 
   function openFromInput(value) {
@@ -849,6 +871,7 @@
       <button role="menuitem" data-action="forget-space" data-id="${spaceId()}">Forget on this device</button>
       ${demo && admin ? '<button role="menuitem" class="danger" data-action="delete-demo">Delete this demo now…</button>' : ''}
       <a role="menuitem" href="#/">All spaces</a>
+      <a role="menuitem" href="help/">Help</a>
     </div>`;
   }
 
