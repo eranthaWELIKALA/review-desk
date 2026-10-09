@@ -32,7 +32,7 @@ GitHub Pages can only serve static files and can't keep a secret, so a small **C
 
 - **Owners and editors** are accounts. A space always keeps at least one owner. Invites are **single-use**, expire after **7 days** and only work for the **email address they were sent to**: a forwarded invite is useless to anyone else.
 - **Review code** (`ABCD-EFGH-JKMN`): anyone with the review link (`…/review-desk/?code=ABCD-EFGH-JKMN#/<space>`) can view and comment. They don't need an account. Signed-in reviewers comment under their account name, which gets a ✓ so it can't be impersonated.
-- **Site admins** are accounts whose email is in `SITE_ADMIN_EMAILS`. They must have **two-step verification** turned on (unless `ADMIN_REQUIRE_MFA=false`).
+- **Site admins** are accounts whose email is in `SITE_ADMIN_EMAILS`. With `ADMIN_REQUIRE_MFA=true` they must turn on **two-step verification** in Clerk, which needs Clerk's Pro plan. This deployment sets it to `false`, so admin access is only as strong as the admin email account: turn on that account's own two-step verification (e.g. Google 2-Step Verification), since every sign-in method, including email links and codes, goes through it.
 - **Demos** stay account-free: the browser that started one holds its space key. Demos can't have editors or send email.
 - **Spaces from before accounts** still have a **space key**. A signed-in key holder can claim the space once (**Make your account the owner**). The key then stops working. Set `LEGACY_SPACE_KEYS=false` when everyone has moved over.
 - Keys and codes are derived from `SPACE_SECRET` (HMAC), so **no key or code is ever stored in the repo**. Issuing a new one invalidates the old one within a minute.
@@ -102,7 +102,7 @@ GitHub → Settings → Developer settings → **Fine-grained personal access to
 ### 3. Sign-in (Clerk)
 
 1. Create an application at [clerk.com](https://clerk.com). Under **User & authentication**, turn on **Email** (with the **email link** or code), and under **SSO connections** turn on **Google**, **GitHub** and **Microsoft**. Development instances use Clerk's shared OAuth credentials, so there's nothing else to set up yet.
-2. Turn on **Multi-factor** (authenticator app) so site admins can use two-step verification.
+2. Optional, Clerk Pro plan only: turn on **Multi-factor** (authenticator app) and set `ADMIN_REQUIRE_MFA = "true"` so site admins must use two-step verification. On the free plan, leave it `false` and protect the admin email account with its own two-step verification.
 3. **Sessions → Customize session token**, add these claims (the Worker needs the email address):
    ```json
    { "email": "{{user.primary_email_address}}", "name": "{{user.full_name}}" }
@@ -178,7 +178,7 @@ Every change in a space is a commit (`review: comment by Nimal`). When two peopl
 | `CLERK_ISSUER` | var | | Clerk Frontend API URL; tokens must come from it |
 | `CLERK_JWT_KEY` | var | | Optional. Clerk's PEM public key, to skip fetching its JWKS |
 | `SITE_URL` | var | | The site's address, for links in emails |
-| `ADMIN_REQUIRE_MFA` | var | `true` | Site admins need two-step verification |
+| `ADMIN_REQUIRE_MFA` | var | `true` (`false` in this repo's `wrangler.toml`) | Site admins need two-step verification in Clerk (Clerk Pro plan) |
 | `LEGACY_SPACE_KEYS` | var | `true` | Space keys of pre-account spaces still allow editing |
 | `EMAIL_FROM` / `EMAIL_DAILY_LIMIT` | var | `onboarding@resend.dev` / `90` | Sender and daily cap |
 | `GITHUB_OWNER`, `GITHUB_REPO` | var | | The data repo |
