@@ -290,6 +290,68 @@ test('demo owners can delete their demo early', async () => {
   }
 });
 
+test('screenshots can be reordered, moved between sections and deleted together', async () => {
+  const { gh, call, restore } = setup();
+  try {
+    const { data: demo } = await call('POST', '/api/demo');
+    const S = `/api/s/${demo.spaceId}`;
+    const as = { key: demo.adminKey };
+    const a = (await call('POST', `${S}/sections`, { ...as, body: { title: 'A' } })).data.id;
+    const b = (await call('POST', `${S}/sections`, { ...as, body: { title: 'B' } })).data.id;
+    let r;
+    for (const n of ['one', 'two', 'three', 'four']) r = await call('POST', `${S}/sections/${a}/images`, { ...as, body: pngBody(`${n}.png`) });
+    const [one, two, three, four] = r.data.images.map((i) => i.id);
+    const names = (sec) => sec.images.map((i) => i.name.replace('.png', ''));
+    const files = () => Object.keys(gh.files('demo-data')).filter((p) => p.startsWith(`spaces/${demo.spaceId}/images/`)).sort();
+
+    // Reorder: listed ones first, the rest keep their place; unknown ids are ignored.
+    r = await call('PATCH', `${S}/sections/${a}`, { ...as, body: { order: [three, one, 'zzzzzzzz'] } });
+    assert.deepEqual(names(r.data), ['three', 'one', 'two', 'four']);
+    r = await call('PATCH', `${S}/sections/${a}`, { code: demo.reviewCode, body: { order: [one] } });
+    assert.equal(r.status, 403, 'reviewers cannot reorder');
+    r = await call('PATCH', `${S}/sections/${a}`, { ...as, body: { order: 'nope' } });
+    assert.equal(r.status, 400);
+
+    // Move two screenshots, with their comments and replies, to the start of B.
+    await call('POST', `${S}/sections/${b}/images`, { ...as, body: pngBody('b1.png') });
+    r = await call('POST', `${S}/sections/${a}/comments`, { code: demo.reviewCode, body: { author: 'Ann', text: 'Pinned', target: two, pin: { x: 1, y: 2 } } });
+    const cid = r.data.comments[0].id;
+    await call('POST', `${S}/sections/${a}/comments`, { code: demo.reviewCode, body: { author: 'Ann', text: 'Reply', parentId: cid } });
+    await call('POST', `${S}/sections/${a}/comments`, { code: demo.reviewCode, body: { author: 'Ann', text: 'Whole section' } });
+    r = await call('POST', `${S}/sections/${a}/images/move`, { code: demo.reviewCode, body: { ids: [two], to: b } });
+    assert.equal(r.status, 403, 'reviewers cannot move');
+    r = await call('POST', `${S}/sections/${a}/images/move`, { ...as, body: { ids: [two, four], to: a } });
+    assert.equal(r.status, 400);
+    r = await call('POST', `${S}/sections/${a}/images/move`, { ...as, body: { ids: [two, four], to: b, index: 0 } });
+    assert.equal(r.status, 200);
+    const [srcA, dstB] = r.data.sections;
+    assert.deepEqual([names(srcA), names(dstB)], [['three', 'one'], ['two', 'four', 'b1']]);
+    assert.deepEqual(srcA.comments.map((c) => c.text), ['Whole section']);
+    assert.deepEqual(dstB.comments.map((c) => c.text), ['Pinned', 'Reply']);
+    assert.ok(dstB.images.every((i) => i.path.startsWith(`${b}/`)), 'files move to the new section folder');
+    assert.equal(files().filter((p) => p.includes(`/images/${b}/`)).length, 3);
+    r = await call('GET', `/img/${demo.spaceId}/${dstB.images[0].path}?t=${(await call('GET', `${S}/me`, as)).data.imageToken}`);
+    assert.equal(r.status, 200);
+    r = await call('POST', `${S}/sections/${a}/images/move`, { ...as, body: { ids: [two], to: b } });
+    assert.equal(r.status, 200, 'moving again is a no-op');
+
+    // Deleting section A leaves the moved screenshots alone.
+    r = await call('DELETE', `${S}/sections/${a}`, as);
+    assert.equal(files().length, 3);
+
+    // Delete several at once: comments go too and storage is freed.
+    r = await call('POST', `${S}/sections/${b}/images/delete`, { ...as, body: { ids: [two, four] } });
+    assert.deepEqual([names(r.data), r.data.comments.length], [['b1'], 0]);
+    assert.equal(files().length, 1);
+    r = await call('GET', `${S}/project`, as);
+    assert.equal(r.data.space.usedBytes, PNG.length);
+    r = await call('POST', `${S}/sections/${b}/images/delete`, { ...as, body: { ids: [two] } });
+    assert.deepEqual([r.status, names(r.data)], [200, ['b1']]);
+  } finally {
+    restore();
+  }
+});
+
 test('site admin can create spaces directly and change quota', async () => {
   const { call, restore } = setup();
   try {

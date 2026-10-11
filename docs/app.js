@@ -75,6 +75,11 @@
     highlight: null,     // comment id hovered
     menuOpen: false,
     welcome: null,       // demo id that was just created
+    selecting: false,    // picking screenshots in the open section
+    selected: new Set(), // screenshot ids picked
+    selectSid: null,     // the section the selection belongs to
+    lastPick: null,      // last screenshot picked, for Shift-click ranges
+    upq: null,           // files waiting to be uploaded: { items: [{ file, url }] }
     lastLoad: 0,
     busy: false,
   };
@@ -106,6 +111,10 @@
     mail: svg('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>'),
     shield: svg('<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/>'),
     x: svg('<path d="M6 6l12 12M18 6L6 18"/>', 2.4),
+    up: svg('<path d="M6 15l6-6 6 6"/>'),
+    down: svg('<path d="M6 9l6 6 6-6"/>'),
+    move: svg('<path d="M4 12h15M14 7l5 5-5 5"/>'),
+    grip: svg('<circle cx="9" cy="6" r="1.2"/><circle cx="15" cy="6" r="1.2"/><circle cx="9" cy="12" r="1.2"/><circle cx="15" cy="12" r="1.2"/><circle cx="9" cy="18" r="1.2"/><circle cx="15" cy="18" r="1.2"/>', 2.2),
   };
 
   /* ---------------------------------------------------------------- helpers */
@@ -815,6 +824,8 @@
 
     const section = currentSection();
     if (section && state.route.sid !== section.id && !state.route.iid) state.route.sid = section.id;
+    if (state.selectSid !== section?.id) { state.selecting = false; state.selected.clear(); state.selectSid = section?.id; }
+    if (section) for (const iid of state.selected) if (!section.images.some((i) => i.id === iid)) state.selected.delete(iid);
 
     app.innerHTML = `
       ${spaceTopbar()}
@@ -920,32 +931,47 @@
   function sectionView(s) {
     const admin = isAdmin();
     const open = openCount(s.comments);
+    const picking = admin && state.selecting;
     const cards = s.images.map((img) => {
       const n = openCount(s.comments, img.id);
-      return `<button class="card" data-action="open-image" data-iid="${img.id}" aria-label="Open ${esc(img.caption || img.name)}">
-        <div class="thumb"><img src="${esc(imageUrl(img))}" alt="" loading="lazy"></div>
+      const on = picking && state.selected.has(img.id);
+      return `<button class="card${on ? ' selected' : ''}" data-action="${picking ? 'pick' : 'open-image'}" data-iid="${img.id}" ${picking ? `aria-pressed="${on}"` : ''} aria-label="${picking ? 'Select' : 'Open'} ${esc(img.caption || img.name)}">
+        <div class="thumb"><img src="${esc(imageUrl(img))}" alt="" loading="lazy" draggable="false"></div>
+        ${picking ? `<span class="check" aria-hidden="true">${I.check}</span>` : ''}
         ${n ? `<span class="badge hot">${I.chat}${n}</span>` : ''}
-        <div class="card-body"><span class="cap">${esc(img.caption || img.name)}<span class="sub">${ago(img.uploadedAt)}</span></span></div>
+        <div class="card-body"><span class="cap">${esc(img.caption || img.name)}<span class="sub">${ago(img.uploadedAt)}</span></span>
+          ${admin ? `<span class="grip" title="Drag to reorder, or onto a section to move it there" aria-hidden="true">${I.grip}</span>` : ''}</div>
       </button>`;
     }).join('');
+    const k = state.selected.size;
+    const selbar = picking ? `<div class="selbar" role="toolbar" aria-label="Selected screenshots">
+        <b>${k} selected</b>
+        <button class="link-btn" data-action="pick-all">${k === s.images.length ? 'Select none' : 'Select all'}</button>
+        <span class="grow"></span>
+        <button class="btn sm" data-action="move-picked" ${k ? '' : 'disabled'}>${I.move}Move to…</button>
+        <button class="btn sm danger" data-action="delete-picked" ${k ? '' : 'disabled'}>${I.trash}Delete</button>
+        <button class="btn sm primary" data-action="pick-done">Done</button>
+      </div>` : '';
 
     return `
       <div class="section-head">
         <div class="titles">
           <h1>${esc(s.title)}</h1>
           ${s.description ? `<p class="desc">${esc(s.description)}</p>` : ''}
-          <div class="meta">${plural(s.images.length, 'screenshot')} · ${plural(open, 'open comment')}</div>
+          <div class="meta">${plural(s.images.length, 'screenshot')} · ${plural(open, 'open comment')}${admin && s.images.length > 1 ? `<span class="hide-sm"> · drag to reorder, or onto a section to move</span>` : ''}</div>
         </div>
         <div class="actions">
           <button class="btn sm" data-action="copy-link" data-sid="${s.id}">${I.link}Copy link</button>
           ${admin ? `
             <button class="btn sm" data-action="edit-section">${I.edit}Edit</button>
             <button class="btn sm danger" data-action="delete-section">${I.trash}Delete</button>
+            ${s.images.length && !picking ? `<button class="btn sm" data-action="pick-start">${I.check}Select</button>` : ''}
             <button class="btn sm primary" data-action="pick-files">${I.upload}Upload</button>` : ''}
         </div>
       </div>
       ${admin ? `<div class="dropzone" id="dropzone">${I.upload}<span>${coarse ? 'Tap Upload to add screenshots' : 'Drop screenshots here<span class="long">, or paste one with Ctrl/⌘ + V</span>'}</span></div>
         <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>` : ''}
+      ${selbar}
       ${s.images.length ? `<div class="grid">${cards}</div>` : `<div class="empty"><h3>No screenshots in this section</h3><p>${admin ? 'Upload some to start collecting feedback.' : 'Check back soon.'}</p></div>`}
       <section class="feedback">
         <div class="feedback-head"><h2>Section feedback</h2><p>General thoughts on this flow as a whole</p></div>
@@ -1047,6 +1073,7 @@
             <button class="btn ghost icon hide-sm" data-action="toggle-fit" title="${fit ? 'Actual size' : 'Fit to screen'}" aria-label="${fit ? 'Actual size' : 'Fit to screen'}">${I.fit}</button>
             <button class="btn ghost icon hide-sm" data-action="copy-link" data-sid="${s.id}" data-iid="${img.id}" title="Copy link to this screenshot" aria-label="Copy link">${I.link}</button>
             ${isAdmin() ? `<button class="btn ghost icon" data-action="edit-caption" title="Edit caption" aria-label="Edit caption">${I.edit}</button>
+              <button class="btn ghost icon" data-action="move-image" title="Move to another section or position" aria-label="Move screenshot">${I.move}</button>
               <button class="btn ghost icon danger" data-action="delete-image" title="Delete screenshot" aria-label="Delete screenshot">${I.trash}</button>` : ''}
             <button class="btn ghost icon" data-action="nav-image" data-dir="-1" title="Previous (←)" aria-label="Previous" ${idx === 0 ? 'disabled' : ''}>${I.left}</button>
             <button class="btn ghost icon" data-action="nav-image" data-dir="1" title="Next (→)" aria-label="Next" ${idx === s.images.length - 1 ? 'disabled' : ''}>${I.right}</button>
@@ -1628,6 +1655,77 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     }),
     'pick-files': () => $('#file-input')?.click(),
 
+    // selecting, moving and deleting several screenshots
+    'pick-start': () => { state.selecting = true; state.selected.clear(); state.lastPick = null; render(); },
+    'pick-done': () => { state.selecting = false; state.selected.clear(); render(); },
+    'pick': (el) => {
+      const s = currentSection();
+      const iid = el.dataset.iid;
+      const sel = state.selected;
+      if (state.lastShift && state.lastPick && state.lastPick !== iid) {
+        // Shift-click picks everything between the last pick and this one.
+        const ids = s.images.map((i) => i.id);
+        const [a, b] = [ids.indexOf(state.lastPick), ids.indexOf(iid)].sort((x, y) => x - y);
+        if (a !== -1) for (const id of ids.slice(a, b + 1)) sel.add(id);
+      } else if (sel.has(iid)) sel.delete(iid); else sel.add(iid);
+      state.lastPick = iid;
+      render();
+    },
+    'pick-all': () => {
+      const s = currentSection();
+      if (state.selected.size === s.images.length) state.selected.clear(); else for (const i of s.images) state.selected.add(i.id);
+      render();
+    },
+    'move-picked': () => {
+      const s = currentSection();
+      moveDialog(s, pickedIds(s), (to) => { if (to !== s.id) { state.selecting = false; state.selected.clear(); render(); } });
+    },
+    'delete-picked': () => {
+      const s = currentSection();
+      const ids = pickedIds(s);
+      if (!ids.length) return;
+      const n = s.comments.filter((c) => ids.includes(c.target)).length;
+      confirmBox(`Delete ${plural(ids.length, 'screenshot')}?`, `This removes ${ids.length === 1 ? 'the screenshot' : `these ${ids.length} screenshots`}${n ? ` and ${plural(n, 'comment')} on them` : ''}.`, 'Delete', async () => {
+        applySection(await api('POST', `/api/s/${spaceId()}/sections/${s.id}/images/delete`, { ids }));
+        state.selecting = false;
+        state.selected.clear();
+        render();
+        toast(`${plural(ids.length, 'screenshot')} deleted`);
+      });
+    },
+    'move-image': () => {
+      const s = currentSection();
+      const iid = state.route.iid;
+      const idx = s.images.findIndex((i) => i.id === iid);
+      moveDialog(s, [iid], (to) => {
+        if (to === s.id) return;
+        // The screenshot left this section: show the one that took its place.
+        const rest = currentSection().images;
+        go(s.id, rest[Math.min(idx, rest.length - 1)]?.id);
+      });
+    },
+
+    // ordering files before an upload
+    'uq-move': (el) => {
+      const i = Number(el.dataset.i);
+      const dir = Number(el.dataset.dir);
+      const items = state.upq.items;
+      [items[i], items[i + dir]] = [items[i + dir], items[i]];
+      redrawUploads();
+      $(`#uq-list [data-action="uq-move"][data-i="${i + dir}"][data-dir="${dir}"]:not([disabled])`)?.focus();
+    },
+    'uq-remove': (el) => {
+      const [gone] = state.upq.items.splice(Number(el.dataset.i), 1);
+      URL.revokeObjectURL(gone.url);
+      redrawUploads();
+    },
+    'uq-sort': (el) => {
+      const items = state.upq.items;
+      if (el.dataset.by === 'reverse') items.reverse();
+      else items.sort(el.dataset.by === 'date' ? (a, b) => a.file.lastModified - b.file.lastModified : (a, b) => byName(a.file, b.file));
+      redrawUploads();
+    },
+
     // site admin
     'admin-tab': (el) => {
       state.adminTab = el.dataset.tab;
@@ -1777,12 +1875,256 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     }
   }
 
+  /* ------------------------------------------------- reordering and moving */
+  // Selected screenshots, in the section's order.
+  const pickedIds = (s) => s.images.filter((i) => state.selected.has(i.id)).map((i) => i.id);
+
+  // Saves a new order for a section's screenshots, showing it straight away.
+  async function saveOrder(s, images) {
+    if (images.every((img, i) => img === s.images[i])) return;
+    const before = s.images;
+    s.images = images;
+    render();
+    try {
+      applySection(await api('PATCH', `/api/s/${spaceId()}/sections/${s.id}`, { order: images.map((i) => i.id) }));
+      render();
+    } catch (e) {
+      s.images = before;
+      render();
+      toast(e.message, 'error');
+    }
+  }
+
+  // Moves screenshots to `index` (null: the end) of section `to`, which may be their own.
+  async function moveImages(s, ids, to, index) {
+    if (to === s.id) {
+      const rest = s.images.filter((i) => !ids.includes(i.id));
+      const moving = s.images.filter((i) => ids.includes(i.id));
+      const at = index == null ? rest.length : index;
+      return saveOrder(s, [...rest.slice(0, at), ...moving, ...rest.slice(at)]);
+    }
+    const dest = state.project.sections.find((x) => x.id === to);
+    const out = await api('POST', `/api/s/${spaceId()}/sections/${s.id}/images/move`, { ids, to, ...(index == null ? {} : { index }) });
+    out.sections.forEach(applySection);
+    render();
+    toast(`Moved ${plural(ids.length, 'screenshot')} to “${dest?.title || 'another section'}”`);
+  }
+
+  function moveDialog(s, ids, after) {
+    if (!ids.length) return;
+    const sections = state.project.sections;
+    const pick = sections.length > 1 ? sections.find((x) => x.id !== s.id).id : s.id;
+    modal({
+      title: ids.length === 1 ? 'Move screenshot' : `Move ${ids.length} screenshots`,
+      html: `<div class="field"><label for="mv-to">Section</label>
+          <select class="input" id="mv-to" name="to">${sections.map((x) => `<option value="${x.id}" ${x.id === pick ? 'selected' : ''}>${esc(x.title)}${x.id === s.id ? ' (this section)' : ''}</option>`).join('')}</select></div>
+        <div class="field"><label for="mv-at">Position</label>
+          <select class="input" id="mv-at" name="at"><option value="end">At the end</option><option value="start">At the start</option></select></div>`,
+      confirm: 'Move',
+      onSubmit: async (v) => {
+        await moveImages(s, ids, v.to, v.at === 'start' ? 0 : null);
+        after?.(v.to);
+      },
+    });
+  }
+
+  // Drag a screenshot (or all selected ones) to reorder it, or onto a section in
+  // the sidebar to move it there; also reorders files before an upload. Pointer
+  // events, so it works with a mouse (drag the whole card) and on touch (drag by
+  // the grip, so the page still scrolls).
+  let drag = null;
+  let swallowClick = false;
+  document.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || drag) return;
+    const item = e.target.closest('.grid .card[data-iid], .uq-row');
+    if (!item || e.target.closest('button:not(.card)')) return;
+    if (item.classList.contains('card') && (!isAdmin() || state.route.iid)) return;
+    if (e.pointerType !== 'mouse' && !e.target.closest('.grip')) return;
+    drag = { item, kind: item.classList.contains('card') ? 'card' : 'row', x: e.clientX, y: e.clientY, cx: e.clientX, cy: e.clientY, pid: e.pointerId, on: false };
+  });
+  document.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.pid) return;
+    drag.cx = e.clientX;
+    drag.cy = e.clientY;
+    if (!drag.on) {
+      if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 6) return;
+      startDrag();
+    }
+    e.preventDefault();
+    drag.ghost.style.transform = `translate(${e.clientX - drag.dx}px, ${e.clientY - drag.dy}px)`;
+    markDropTarget();
+  }, { passive: false });
+  document.addEventListener('pointerup', (e) => { if (drag && e.pointerId === drag.pid) endDrag(true); });
+  document.addEventListener('pointercancel', (e) => { if (drag && e.pointerId === drag.pid) endDrag(false); });
+  document.addEventListener('dragstart', (e) => { if (e.target.closest?.('.grid .card, .uq-row')) e.preventDefault(); });
+  // The click that ends a drag must not open the screenshot.
+  document.addEventListener('click', (e) => { if (swallowClick) { e.stopPropagation(); e.preventDefault(); swallowClick = false; } }, true);
+
+  function startDrag() {
+    const { item, kind } = drag;
+    drag.on = true;
+    if (kind === 'card') {
+      const s = currentSection();
+      drag.sid = s.id;
+      drag.ids = state.selected.has(item.dataset.iid) ? pickedIds(s) : [item.dataset.iid];
+      for (const id of drag.ids) document.querySelector(`.grid .card[data-iid="${id}"]`)?.classList.add('drag-src');
+    } else {
+      drag.ids = [Number(item.dataset.i)];
+      item.classList.add('drag-src');
+    }
+    const r = item.getBoundingClientRect();
+    const scale = kind === 'card' ? 0.6 : 1;
+    drag.dx = (drag.x - r.left) * scale;
+    drag.dy = (drag.y - r.top) * scale;
+    const g = item.cloneNode(true);
+    g.classList.remove('drag-src', 'selected');
+    g.classList.add('drag-ghost');
+    g.removeAttribute('data-action');
+    g.setAttribute('aria-hidden', 'true');
+    g.style.width = `${r.width * scale}px`;
+    if (drag.ids.length > 1) g.insertAdjacentHTML('beforeend', `<span class="drag-count">${drag.ids.length}</span>`);
+    document.body.append(g);
+    document.body.classList.add('dragging');
+    drag.ghost = g;
+    drag.raf = requestAnimationFrame(autoScroll);
+  }
+
+  function clearDropMarks() {
+    for (const el of document.querySelectorAll('.drop-before, .drop-after, .drop-into')) el.classList.remove('drop-before', 'drop-after', 'drop-into');
+  }
+
+  function markDropTarget() {
+    clearDropMarks();
+    const el = document.elementFromPoint(drag.cx, drag.cy);
+    drag.target = null;
+    if (drag.kind === 'card') {
+      const nav = el?.closest('.nav-item[data-sid]');
+      if (nav && nav.dataset.sid !== drag.sid) {
+        nav.classList.add('drop-into');
+        drag.target = { to: nav.dataset.sid };
+        return;
+      }
+      const card = el?.closest('.grid .card[data-iid]');
+      if (card && !drag.ids.includes(card.dataset.iid)) {
+        const r = card.getBoundingClientRect();
+        const after = drag.cx > r.left + r.width / 2;
+        card.classList.add(after ? 'drop-after' : 'drop-before');
+        drag.target = { iid: card.dataset.iid, after };
+      }
+    } else {
+      const row = el?.closest('.uq-row');
+      if (row && !row.classList.contains('drag-src') && row.dataset.i !== undefined) {
+        const r = row.getBoundingClientRect();
+        const after = drag.cy > r.top + r.height / 2;
+        row.classList.add(after ? 'drop-after' : 'drop-before');
+        drag.target = { i: Number(row.dataset.i), after };
+      }
+    }
+  }
+
+  // Scrolls the page (or the upload list) while dragging near its edge.
+  function autoScroll() {
+    if (!drag?.on) return;
+    const box = drag.kind === 'row' ? drag.item.closest('.modal') : null;
+    const r = box ? box.getBoundingClientRect() : { top: 0, bottom: innerHeight };
+    const v = drag.cy < r.top + 60 ? -12 : drag.cy > r.bottom - 60 ? 12 : 0;
+    if (v) { (box || window).scrollBy(0, v); markDropTarget(); }
+    drag.raf = requestAnimationFrame(autoScroll);
+  }
+
+  function endDrag(drop) {
+    const d = drag;
+    drag = null;
+    if (!d.on) return;
+    cancelAnimationFrame(d.raf);
+    d.ghost.remove();
+    clearDropMarks();
+    for (const el of document.querySelectorAll('.drag-src')) el.classList.remove('drag-src');
+    document.body.classList.remove('dragging');
+    swallowClick = true;
+    setTimeout(() => { swallowClick = false; });
+    if (!drop || !d.target) return;
+
+    if (d.kind === 'row') {
+      const items = state.upq.items;
+      const from = d.ids[0];
+      let at = d.target.i + (d.target.after ? 1 : 0);
+      if (from < at) at--;
+      items.splice(at, 0, ...items.splice(from, 1));
+      return redrawUploads();
+    }
+    const s = state.project.sections.find((x) => x.id === d.sid);
+    if (!s) return;
+    if (d.target.to) {
+      return run(async () => {
+        await moveImages(s, d.ids, d.target.to, null);
+        for (const id of d.ids) state.selected.delete(id);
+        render();
+      });
+    }
+    const rest = s.images.filter((i) => !d.ids.includes(i.id));
+    const at = rest.findIndex((i) => i.id === d.target.iid) + (d.target.after ? 1 : 0);
+    saveOrder(s, [...rest.slice(0, at), ...s.images.filter((i) => d.ids.includes(i.id)), ...rest.slice(at)]);
+  }
+
   /* ---------------------------------------------------------------- uploads */
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+
   async function uploadFiles(files) {
     const s = currentSection();
     if (!s || !isAdmin()) return;
     const images = [...files].filter((f) => /^image\/(png|jpe?g|gif|webp)$/.test(f.type));
     if (!images.length) return toast('Only PNG, JPG, GIF or WebP images can be uploaded', 'error');
+    if (images.length === 1) return sendFiles(s, images);
+    orderUploads(s, images);
+  }
+
+  // Several files: let the uploader set their order (and where they go) first.
+  function orderUploads(s, files) {
+    for (const it of state.upq?.items || []) URL.revokeObjectURL(it.url);
+    state.upq = { items: files.sort(byName).map((file) => ({ file, url: URL.createObjectURL(file) })) };
+    modal({
+      title: `Upload ${files.length} screenshots`,
+      text: 'They’re added in this order. Drag to rearrange, or sort them.',
+      html: `<div class="uq-sort">Sort by
+          <button type="button" class="link-btn" data-action="uq-sort" data-by="name">Name</button>·
+          <button type="button" class="link-btn" data-action="uq-sort" data-by="date">Date modified</button>·
+          <button type="button" class="link-btn" data-action="uq-sort" data-by="reverse">Reverse</button></div>
+        <ol class="uq-list" id="uq-list">${uploadRows()}</ol>
+        ${s.images.length ? `<div class="field"><label for="uq-at">Add them</label>
+          <select class="input" id="uq-at" name="at"><option value="end">After the screenshots already here</option><option value="start">Before the screenshots already here</option></select></div>` : ''}`,
+      confirm: 'Upload',
+      onSubmit: (v) => {
+        const items = state.upq.items;
+        state.upq = null;
+        sendFiles(s, items.map((it) => it.file), v.at).finally(() => items.forEach((it) => URL.revokeObjectURL(it.url)));
+      },
+    });
+  }
+
+  function uploadRows() {
+    const items = state.upq.items;
+    return items.map((it, i) => `<li class="uq-row" data-i="${i}">
+        <span class="grip" title="Drag to reorder" aria-hidden="true">${I.grip}</span>
+        <span class="uq-num">${i + 1}</span>
+        <img src="${esc(it.url)}" alt="" draggable="false">
+        <span class="uq-name">${esc(it.file.name)}<small>${fmtBytes(it.file.size)}</small></span>
+        <button type="button" class="btn ghost sm icon" data-action="uq-move" data-i="${i}" data-dir="-1" aria-label="Move ${esc(it.file.name)} up" ${i === 0 ? 'disabled' : ''}>${I.up}</button>
+        <button type="button" class="btn ghost sm icon" data-action="uq-move" data-i="${i}" data-dir="1" aria-label="Move ${esc(it.file.name)} down" ${i === items.length - 1 ? 'disabled' : ''}>${I.down}</button>
+        <button type="button" class="btn ghost sm icon" data-action="uq-remove" data-i="${i}" aria-label="Don’t upload ${esc(it.file.name)}">${I.x}</button>
+      </li>`).join('');
+  }
+
+  function redrawUploads() {
+    const n = state.upq.items.length;
+    if (!n) { state.upq = null; $('#modal-root').innerHTML = ''; return; }
+    $('#uq-list').innerHTML = uploadRows();
+    $('#modal-title').textContent = `Upload ${plural(n, 'screenshot')}`;
+  }
+
+  // Uploads one at a time, so they arrive in order; `at` 'start' then moves them to the front.
+  async function sendFiles(s, images, at = 'end') {
+    const added = [];
     let done = 0;
     const t = toast(`Uploading 1 of ${images.length}…`, 'busy');
     for (const file of images) {
@@ -1799,7 +2141,9 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
         });
         const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }[file.type];
         const filename = /\.[a-z0-9]+$/i.test(file.name) ? file.name : `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${ext}`;
-        applySection(await api('POST', `/api/s/${spaceId()}/sections/${s.id}/images`, { filename, data }));
+        const sec = await api('POST', `/api/s/${spaceId()}/sections/${s.id}/images`, { filename, data });
+        applySection(sec);
+        added.push(sec.images[sec.images.length - 1].id);
         done++;
         render();
       } catch (e) {
@@ -1807,11 +2151,16 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
       }
     }
     t.remove();
+    const sec = state.project?.sections.find((x) => x.id === s.id);
+    if (at === 'start' && added.length && sec) {
+      await saveOrder(sec, [...sec.images.filter((i) => added.includes(i.id)), ...sec.images.filter((i) => !added.includes(i.id))]);
+    }
     if (done) toast(`${plural(done, 'screenshot')} uploaded`);
   }
 
   /* ----------------------------------------------------------------- events */
   document.addEventListener('click', (e) => {
+    state.lastShift = e.shiftKey;
     if (state.menuOpen === 'account' && !e.target.closest('.account-wrap')) toggleAccountMenu(false);
     else if (state.menuOpen === 'space' && !e.target.closest('.menu-wrap')) { state.menuOpen = false; render(); }
     const el = e.target.closest('[data-action]');
@@ -1864,6 +2213,7 @@ Your Review Desk space${title ? ` "${title}"` : ''} is ready.
     }
     if (e.key === 'Escape' && state.menuOpen === 'account') { toggleAccountMenu(false); return; }
     if (e.key === 'Escape' && state.menuOpen) { state.menuOpen = false; render(); return; }
+    if (e.key === 'Escape' && state.selecting && !state.route.iid && !$('#modal-root').innerHTML) { actions['pick-done'](); return; }
     if ($('#modal-root').innerHTML || !state.route.iid) return;
     if (e.target.matches?.('input, textarea')) {
       if (e.key === 'Escape') e.target.blur();

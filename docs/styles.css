@@ -304,6 +304,49 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .card .badge.hot { background: var(--accent); }
 .card .badge svg { width: 13px; height: 13px; }
 
+/* selecting, dragging to reorder or move */
+.grip { display: grid; place-items: center; width: 28px; height: 28px; margin: -4px -6px -4px 0; border-radius: 6px; color: var(--text-3); cursor: grab; touch-action: none; flex: none; }
+.grip svg { width: 16px; height: 16px; }
+.grip:hover { background: var(--surface-2); color: var(--text); }
+@media (hover: hover) { .card .grip { opacity: 0; } .card:hover .grip, .card:focus-visible .grip { opacity: 1; } }
+.card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent), var(--shadow); }
+.card .check {
+  position: absolute; top: 10px; left: 10px; width: 24px; height: 24px; border-radius: 50%;
+  display: grid; place-items: center; background: rgba(255, 255, 255, .92); border: 2px solid var(--border-strong); color: transparent;
+}
+.card .check svg { width: 14px; height: 14px; }
+.card.selected .check { background: var(--accent); border-color: #fff; color: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, .3); }
+.card.drag-src, .uq-row.drag-src { opacity: .35; }
+.card.drop-before { box-shadow: -6px 0 0 0 var(--accent), var(--shadow); }
+.card.drop-after { box-shadow: 6px 0 0 0 var(--accent), var(--shadow); }
+.nav-item.drop-into { background: var(--accent-soft); color: var(--accent-text); outline: 2px dashed var(--accent); outline-offset: -2px; }
+body.dragging, body.dragging * { cursor: grabbing !important; user-select: none; -webkit-user-select: none; }
+body.dragging .card { transform: none; transition: box-shadow .1s; }
+.drag-ghost { position: fixed; left: 0; top: 0; z-index: 120; margin: 0; pointer-events: none; opacity: .92; box-shadow: var(--shadow-lg); rotate: 1.5deg; transition: none; }
+.drag-count {
+  position: absolute; top: 8px; left: 8px; min-width: 26px; height: 26px; padding: 0 7px; border-radius: 99px;
+  display: grid; place-items: center; background: var(--accent); color: #fff; font-size: 13px; font-weight: 700;
+}
+.selbar {
+  position: sticky; top: calc(var(--topbar) + 8px); z-index: 5;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 10px 8px 14px; margin-bottom: 18px;
+  border: 1px solid var(--accent); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow);
+}
+.selbar .grow { flex: 1; }
+
+/* ordering files before an upload */
+.uq-sort { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: -6px 0 10px; color: var(--text-3); font-size: 12.5px; }
+.uq-list { list-style: none; margin: 0 0 16px; padding: 0; display: grid; gap: 6px; }
+.uq-row { display: flex; align-items: center; gap: 8px; padding: 5px 4px 5px 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); user-select: none; -webkit-user-select: none; }
+.uq-row .grip { margin: 0 -4px 0 0; }
+.uq-row img { width: 44px; height: 33px; object-fit: cover; object-position: top; border-radius: 4px; background: var(--surface-2); flex: none; }
+.uq-num { width: 18px; text-align: right; color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; flex: none; }
+.uq-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
+.uq-name small { display: block; color: var(--text-3); font-size: 11.5px; font-weight: 400; }
+.uq-row .btn.icon svg { width: 16px; height: 16px; }
+.uq-row.drop-before { box-shadow: 0 -3px 0 0 var(--accent); }
+.uq-row.drop-after { box-shadow: 0 3px 0 0 var(--accent); }
+
 .empty { padding: 56px 24px; text-align: center; color: var(--text-3); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
 .empty h3 { margin: 0 0 6px; color: var(--text); font-size: 16px; }
 .empty p { margin: 0 0 16px; }
@@ -407,6 +450,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   }
   .sidebar::-webkit-scrollbar { display: none; }
   .sidebar h2 { display: none; }
+  .selbar { top: calc(var(--topbar) + 56px); } /* below the sticky row of sections */
   .nav-item { width: auto; flex: none; max-width: 70vw; }
   .sidebar .add { width: auto; margin: 0; flex: none; }
   .main { padding: 20px 16px 64px; }

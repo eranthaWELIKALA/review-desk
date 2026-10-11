@@ -252,6 +252,8 @@ async function spaceRoutes(request, env, id, p, method) {
     }
     if (b && c === 'images') {
       if (!d && method === 'POST') { needAdmin(); return json(await uploadImage(env, sp, b, await readBody(request, 22 * MB)), 201); }
+      if (d === 'move' && !e && method === 'POST') { needAdmin(); return json(await moveImages(env, sp, b, await readBody(request))); }
+      if (d === 'delete' && !e && method === 'POST') { needAdmin(); return json(await deleteImages(env, sp, b, await readBody(request))); }
       if (d && !e && method === 'PATCH') { needAdmin(); return json(await updateImage(env, sp, b, d, await readBody(request))); }
       if (d && !e && method === 'DELETE') { needAdmin(); return json(await deleteImage(env, sp, b, d)); }
     }
@@ -1360,8 +1362,23 @@ async function updateSection(env, sp, id, body) {
     must(s, 'Section');
     if (body.title !== undefined) s.title = cleanText(body.title, 120, 'Title');
     if (body.description !== undefined) s.description = cleanText(body.description, 1000, 'Description', true, true);
+    if (body.order !== undefined) {
+      // Listed screenshots go first, in that order; any the list missed (say, just uploaded) keep their place after them.
+      const order = imageIds(body.order);
+      const byId = new Map(s.images.map((i) => [i.id, i]));
+      const first = order.map((iid) => byId.get(iid)).filter(Boolean);
+      s.images = [...first, ...s.images.filter((i) => !order.includes(i.id))];
+    }
     return s;
-  }, 'review: edit section');
+  }, body.order !== undefined ? 'review: reorder screenshots' : 'review: edit section');
+}
+
+/** A list of screenshot ids from a request body. */
+function imageIds(value) {
+  if (!Array.isArray(value) || value.length > MAX_IMAGES_PER_SECTION || !value.every((v) => typeof v === 'string' && ID_RE.test(v))) {
+    throw new HttpError(400, 'Bad list of screenshots');
+  }
+  return [...new Set(value)];
 }
 
 const sumBytes = (section) => section.images.reduce((n, i) => n + (i.bytes || 0), 0);
@@ -1459,6 +1476,77 @@ async function deleteImage(env, sp, sectionId, imageId) {
   }, 'review: remove screenshot');
   await deleteFileIfExists(env, sp.br, imagePath(sp, removed.path), `review: delete ${forCommit(removed.name)}`);
   if (removed.bytes) await reserve(env, sp, -removed.bytes);
+  return section;
+}
+
+/**
+ * Moves screenshots, with their comments, to another section at `index` (default: the end).
+ * Their files move to the new section's folder, so deleting either section later
+ * removes exactly its own files. Both sections change in one commit.
+ */
+async function moveImages(env, sp, from, body) {
+  const ids = imageIds(body.ids);
+  const to = String(body.to || '');
+  if (!ID_RE.test(to) || to === from) throw new HttpError(400, 'Choose another section to move to');
+  const fromPath = sectionPath(sp, from);
+  const toPath = sectionPath(sp, to);
+  let out;
+  await rewriteBranch(env, sp.br, async (blobs) => {
+    const blob = (path) => blobs.find((x) => x.path === path);
+    const src = JSON.parse(await readBlob(env, must(blob(fromPath), 'Section').sha));
+    const dst = JSON.parse(await readBlob(env, must(blob(toPath), 'Section to move to').sha));
+    out = { sections: [src, dst] };
+    const moving = ids.map((iid) => src.images.find((i) => i.id === iid)).filter(Boolean);
+    if (!moving.length) return null; // already moved or deleted
+    const moved = new Set(moving.map((i) => i.id));
+    const comments = src.comments.filter((c) => moved.has(c.target));
+    if (dst.images.length + moving.length > MAX_IMAGES_PER_SECTION) throw new HttpError(400, `A section can have up to ${MAX_IMAGES_PER_SECTION} screenshots`);
+    if (dst.comments.length + comments.length > MAX_COMMENTS_PER_SECTION) throw new HttpError(400, 'That section has reached its comment limit');
+
+    const drop = [];
+    const write = {};
+    for (const img of moving) {
+      const file = blob(imagePath(sp, img.path));
+      if (!file) continue;
+      img.path = `${to}/${img.path.split('/').pop()}`;
+      drop.push(file.path);
+      write[imagePath(sp, img.path)] = { sha: file.sha };
+    }
+    src.images = src.images.filter((i) => !moved.has(i.id));
+    src.comments = src.comments.filter((c) => !moved.has(c.target));
+    const at = Number.isInteger(body.index) ? Math.min(Math.max(body.index, 0), dst.images.length) : dst.images.length;
+    dst.images.splice(at, 0, ...moving);
+    dst.comments.push(...comments);
+    write[fromPath] = pretty(src);
+    write[toPath] = pretty(dst);
+    const what = moving.length === 1 ? forCommit(moving[0].name) : `${moving.length} screenshots`;
+    return { drop, write, message: `review: move ${what} to "${forCommit(dst.title)}"` };
+  }, { message: 'review: move screenshots' });
+  return out;
+}
+
+/** Deletes several screenshots, their comments and files in one commit. */
+async function deleteImages(env, sp, sid, body) {
+  const ids = new Set(imageIds(body.ids));
+  const file = sectionPath(sp, sid);
+  let section;
+  let freed = 0;
+  await rewriteBranch(env, sp.br, async (blobs) => {
+    section = JSON.parse(await readBlob(env, must(blobs.find((x) => x.path === file), 'Section').sha));
+    const removed = section.images.filter((i) => ids.has(i.id));
+    freed = 0;
+    if (!removed.length) return null; // already deleted
+    section.images = section.images.filter((i) => !ids.has(i.id));
+    section.comments = section.comments.filter((c) => !ids.has(c.target));
+    freed = sumBytes({ images: removed });
+    const paths = new Set(removed.map((i) => imagePath(sp, i.path)));
+    return {
+      drop: blobs.filter((x) => paths.has(x.path)).map((x) => x.path),
+      write: { [file]: pretty(section) },
+      message: `review: remove ${removed.length === 1 ? forCommit(removed[0].name) : `${removed.length} screenshots`}`,
+    };
+  }, { message: 'review: remove screenshots' });
+  if (freed) await reserve(env, sp, -freed);
   return section;
 }
 
@@ -1636,7 +1724,8 @@ async function updateJson(env, br, path, mutate, message, allowCreate = false) {
 
 /**
  * Replace a branch's whole tree in one commit. `plan(blobs)` returns the paths
- * to drop and files to write, or null for no change. Used where the Contents
+ * to drop and files to write (text, or { sha } to reuse an existing blob, e.g.
+ * to rename a file), optionally a commit message, or null for no change. Used where the Contents
  * API would need two calls per file, and for demo cleanup with `orphan`, which
  * also drops the branch history.
  */
@@ -1656,12 +1745,14 @@ async function rewriteBranch(env, br, plan, { message, orphan = false }) {
     const entries = blobs
       .filter((b) => !drop.has(b.path) && !(b.path in write))
       .map((b) => ({ path: b.path, mode: b.mode, type: 'blob', sha: b.sha }));
-    for (const [path, content] of Object.entries(write)) entries.push({ path, mode: '100644', type: 'blob', content });
+    for (const [path, content] of Object.entries(write)) {
+      entries.push(typeof content === 'string' ? { path, mode: '100644', type: 'blob', content } : { path, mode: '100644', type: 'blob', sha: content.sha });
+    }
     if (!entries.length) entries.push({ path: '.keep', mode: '100644', type: 'blob', content: '' });
 
     const newTree = (await ghJson(env, '/git/trees', { method: 'POST', body: JSON.stringify({ tree: entries }) }, 'write')).sha;
     const commit = (await ghJson(env, '/git/commits', {
-      method: 'POST', body: JSON.stringify({ message, tree: newTree, parents: orphan ? [] : [head] }),
+      method: 'POST', body: JSON.stringify({ message: change.message || message, tree: newTree, parents: orphan ? [] : [head] }),
     }, 'write')).sha;
     // A force update can't detect a write that landed meanwhile, so check right before it.
     if (orphan && (await ghJson(env, ref)).object.sha !== head) continue;
